@@ -15,18 +15,28 @@ HEADERS = {
 # The Hunter searches for observable commercial/operational signals.
 # It does NOT treat a generic technology mention as buying intent.
 QUERIES = [
-    '"RFP" "segurança da informação" empresa Brasil',
-    '"RFQ" "tecnologia da informação" empresa Brasil',
-    '"solicitação de proposta" "TI" empresa Brasil',
-    '"cotação" "serviços de TI" empresa Brasil',
+    '"RFP" OR "RFQ" "segurança da informação" Brasil',
+    '"solicitação de proposta" "serviços de TI" Brasil',
     '"contratação" "serviços gerenciados" TI Brasil',
-    '"contratação" "segurança cibernética" empresa Brasil',
+    '"contratação" "segurança cibernética" Brasil',
+    '"busca de fornecedor" TI segurança Brasil',
     '"novo CIO" empresa Brasil',
     '"novo CTO" empresa Brasil',
+    '"novo diretor de tecnologia" empresa Brasil',
     '"novo gerente de TI" empresa Brasil',
     '"migração para cloud" empresa Brasil',
-    '"transformação digital" "infraestrutura de TI" empresa Brasil',
+    '"migração para nuvem" empresa Brasil',
+    '"modernização da infraestrutura" empresa Brasil',
+    '"transformação digital" infraestrutura empresa Brasil',
     '"incidente de segurança" empresa Brasil',
+    'ransomware empresa brasileira 2026',
+    '"expansão" "novas lojas" empresa Brasil',
+    '"nova unidade" empresa "tecnologia" Brasil',
+    '"abertura" "novas unidades" empresa Brasil tecnologia',
+    '"vaga" "segurança da informação" empresa Brasil',
+    '"vaga" "infraestrutura de TI" empresa Brasil',
+    '"vaga" "SOC" empresa Brasil',
+    '"vaga" "analista de infraestrutura" empresa Brasil',
 ]
 
 INTENT_TERMS = [
@@ -86,12 +96,12 @@ def get_db():
 
     required = {
         "companies": {"id","name","website","icp","created_at","updated_at"},
-        "sources": {"id","company_id","title","url","collected_at","content"},
+        "sources": {"id","company_id","title","url","source_type","publisher","collected_at","content"},
         "signals": {"id","company_id","source_id","kind","evidence","evidence_type","created_at"},
         "opportunities": {"id","company_id","trigger_text","need","pain","intent","dm",
                           "timing","score","confidence","classification","next_action",
                           "reason","created_at","updated_at"},
-        "hunts": {"id","started_at","finished_at","status","companies","new_opps",
+        "hunts": {"id","started_at","finished_at","status","sources_found","signals_found","companies","new_opps",
                   "updated_opps","discarded"},
     }
 
@@ -121,7 +131,7 @@ def get_db():
 
     CREATE TABLE IF NOT EXISTS sources(
       id INTEGER PRIMARY KEY, company_id INTEGER, title TEXT, url TEXT UNIQUE,
-      collected_at TEXT, content TEXT);
+      source_type TEXT DEFAULT 'NOTICIA', publisher TEXT, collected_at TEXT, content TEXT);
 
     CREATE TABLE IF NOT EXISTS signals(
       id INTEGER PRIMARY KEY, company_id INTEGER, source_id INTEGER, kind TEXT,
@@ -136,6 +146,7 @@ def get_db():
 
     CREATE TABLE IF NOT EXISTS hunts(
       id INTEGER PRIMARY KEY, started_at TEXT, finished_at TEXT, status TEXT,
+      sources_found INTEGER DEFAULT 0, signals_found INTEGER DEFAULT 0,
       companies INTEGER, new_opps INTEGER, updated_opps INTEGER, discarded INTEGER);
     """)
     # V6 migration/cleanup: never allow a source/publisher to survive as a company.
@@ -194,6 +205,31 @@ def rss_search(query):
     except Exception:
         return []
 
+def pncp_search(max_pages=3):
+    """Consulta pública, sem chave, do PNCP; prioriza propostas abertas."""
+    base="https://pncp.gov.br/api/consulta/v1/contratacoes/proposta"
+    data_final=datetime.now().strftime("%Y%m%d")
+    items=[]
+    for page in range(1,max_pages+1):
+        try:
+            r=requests.get(base,params={"dataFinal":data_final,"pagina":page,"tamanhoPagina":50},headers=HEADERS,timeout=25)
+            r.raise_for_status(); payload=r.json()
+            rows=payload.get("data",payload if isinstance(payload,list) else [])
+            if not rows: break
+            for row in rows:
+                obj=clean_text(row.get("objetoCompra") or row.get("objeto") or "")
+                if not obj or not (term_hits(obj,NEED_TERMS) or term_hits(obj,INTENT_TERMS) or term_hits(obj,TRIGGER_TERMS)): continue
+                org=clean_text(row.get("nomeUnidade") or row.get("nomeOrgao") or row.get("orgaoEntidade") or "")
+                ctrl=clean_text(row.get("numeroControlePNCP") or "")
+                url=clean_text(row.get("linkSistemaOrigem") or "")
+                if not url and ctrl: url="https://pncp.gov.br/app/editais/"+ctrl
+                if not url: url="https://pncp.gov.br/"
+                items.append({"title":clean_text((org+" — "+obj)[:500]),"url":url,"description":obj,
+                              "published":clean_text(row.get("dataPublicacaoPncp") or ""),"publisher":org or "PNCP",
+                              "source_type":"PNCP","company_candidate":org})
+        except Exception: break
+    return items
+
 def fetch_page(url):
     try:
         r = requests.get(url, headers=HEADERS, timeout=20, allow_redirects=True)
@@ -232,89 +268,21 @@ def valid_company(name):
         return False
     return True
 
-def extract_company(title, body, publisher):
-    """
-    V6 company extraction.
-
-    Priority:
-    1) explicit company/group/organization patterns;
-    2) headline subject before a strong business verb;
-    3) company name after "X anuncia/contrata/busca..." patterns.
-
-    The publisher is NEVER accepted as the company.
-    Generic media/source names are rejected.
-    """
-    t = strip_publisher(title, publisher)
-    text = clean_text(t + " " + (body or "")[:30000])
-
-    def add(c, out):
-        c = clean_text(c).strip(" -–—:,.()[]\"'")
-        # Remove leading grammatical noise.
-        c = re.sub(r"^(?:a|o|as|os)\s+", "", c, flags=re.I)
-        if valid_company(c) and c.lower() not in {x.lower() for x in out}:
-            out.append(c)
-
-    candidates = []
-
-    # Strong explicit organization patterns.
-    explicit_patterns = [
-        r"\b(?:empresa|grupo|companhia|holding|organização|organizacao)\s+([A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'/-]*(?:\s+[A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'/-]*){0,7})",
-        r"\b(?:da|do|na|no|em)\s+(?:empresa|grupo|companhia|holding)\s+([A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'/-]*(?:\s+[A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'/-]*){0,7})"
+def extract_company(title, body, publisher, explicit_candidate=None):
+    if explicit_candidate and valid_company(explicit_candidate) and explicit_candidate.lower() != (publisher or "").lower():
+        return clean_text(explicit_candidate)
+    t=strip_publisher(title,publisher); text=clean_text(t+" "+(body or "")[:35000]); candidates=[]
+    def add(c):
+        c=clean_text(c).strip(" -–—:,.()[]\"'"); c=re.sub(r"^(?:a|o|as|os)\s+","",c,flags=re.I)
+        if valid_company(c) and c.lower() != (publisher or "").lower() and c.lower() not in [x.lower() for x in candidates]: candidates.append(c)
+    patterns=[
+      r"\b(?:empresa|grupo|companhia|holding|marca|rede)\s+([A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'/-]*(?:\s+[A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'/-]*){0,7})",
+      r"^([A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'/-]*(?:\s+[A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'/-]*){0,7}?)\s+(?:anuncia|anunciou|contrata|contratou|busca|buscou|expande|expandiu|abre|abriu|projeta|prevê|preve|investe|investiu)\b",
+      r"^([A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'/-]*(?:\s+[A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'/-]*){0,5})\s*[:\-–—]\s+"
     ]
-    for p in explicit_patterns:
-        for m in re.finditer(p, text):
-            add(m.group(1), candidates)
-
-    # Headline-oriented extraction. This is deliberately restricted to
-    # strong verbs so ordinary headlines don't become fake companies.
-    headline = t.split(" | ")[0].strip()
-    verb = (
-        r"(?:anuncia|anunciou|contrata|contratou|busca|buscou|procura|procurou|"
-        r"seleciona|selecionou|investe|investiu|expande|expandiu|abre|abriu|"
-        r"lança|lancou|lançou|adota|adotou|implementa|implementou|"
-        r"migra|migrou|inicia|iniciou|moderniza|modernizou|reestrutura|"
-        r"reestruturou|troca|trocou|vai contratar|pretende contratar)"
-    )
-    m = re.match(
-        rf"^\s*([A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'/-]*(?:\s+[A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'/-]*){{0,7}}?)\s+{verb}\b",
-        headline, flags=re.I
-    )
-    if m:
-        add(m.group(1), candidates)
-
-    # "X: ...", "X anuncia..." common business-news format.
-    if not candidates:
-        m = re.match(
-            r"^\s*([A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'/-]*(?:\s+[A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'/-]*){0,5})\s*[:\-–—]\s+",
-            headline
-        )
-        if m and any(v in headline.lower() for v in [
-            "segurança","tecnologia","ti","cloud","nuvem","infraestrutura",
-            "ciber","backup","dados","ransomware","contratação","fornecedor"
-        ]):
-            add(m.group(1), candidates)
-
-    # If body has "X, [cargo], ..." use the proper name only when followed
-    # by a company-context expression.
-    body_patterns = [
-        r"\b(?:na|no|da|do)\s+([A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'/-]*(?:\s+[A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'/-]*){0,5})\s*,",
-        r"\b([A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'/-]*(?:\s+[A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'/-]*){0,5})\s+(?:é|e está|está)\s+(?:uma|um)\s+(?:das|dos)"
-    ]
-    for p in body_patterns:
-        for m in re.finditer(p, body or ""):
-            add(m.group(1), candidates)
-
-    # Remove obvious media/publisher candidates and prefer a candidate that
-    # appears in the headline.
-    pub = (publisher or "").lower().strip()
-    filtered = [c for c in candidates if c.lower() not in GENERIC_COMPANIES and c.lower() != pub]
-    if not filtered:
-        return None
-
-    hl = headline.lower()
-    in_headline = [c for c in filtered if c.lower() in hl]
-    pool = in_headline or filtered
-    return sorted(pool, key=lambda x: (len(x.split()) > 8, len(x)))[0]
+    for ptn in patterns:
+        for m in re.finditer(ptn,text,flags=re.I): add(m.group(1))
+    return candidates[0] if candidates else None
 
 def best_evidence(text, terms):
     sentences = re.split(r"(?<=[.!?])\s+", clean_text(text))
@@ -362,177 +330,56 @@ def classify(intent, need, pain, trigger, dm):
     return intent_level, need_level, pain_level, timing_level, dm_level, score, confidence, cls
 
 def run_hunt():
-    con = get_db()
-    cur = con.cursor()
-    cur.execute("INSERT INTO hunts(started_at,status) VALUES(?,?)", (now(), "RUNNING"))
-    hunt_id = cur.lastrowid
-    con.commit()
-
-    seen_urls = set()
-    companies = set()
-    new_opps = updated = discarded = 0
-    sources_found = 0
-
+    con=get_db(); cur=con.cursor(); cur.execute("INSERT INTO hunts(started_at,status) VALUES(?,?)",(now(),"RUNNING")); hunt_id=cur.lastrowid; con.commit()
+    raw=[]; seen=set(); companies=set(); sources_found=signals_found=discarded=new_opps=updated=0
     try:
-        for query in QUERIES:
-            for item in rss_search(query):
-                url = item["url"]
-                if url in seen_urls:
-                    continue
-                seen_urls.add(url)
-                sources_found += 1
-
-                rss_title = item["title"]
-                publisher = item["publisher"]
-                rss_desc = BeautifulSoup(item["description"], "html.parser").get_text(" ", strip=True)
-
-                page_title, page_text, final_url = fetch_page(url)
-                # Google News RSS links may remain on google.com; use RSS metadata as the canonical public evidence.
-                if "news.google.com" in (final_url or ""):
-                    final_url = url
-                article_title = page_title or strip_publisher(rss_title, publisher)
-                body = page_text or rss_desc
-                combined = clean_text(article_title + " " + rss_desc + " " + body)
-
-                company = extract_company(article_title, body, publisher)
-                if not company:
-                    discarded += 1
-                    continue
-
-                intent_hits = term_hits(combined, INTENT_TERMS)
-                need_hits = term_hits(combined, NEED_TERMS)
-                trigger_hits = term_hits(combined, TRIGGER_TERMS)
-                pain_hits = term_hits(combined, PAIN_TERMS)
-                dm_hits = term_hits(combined, DM_TERMS)
-
-                # Mandatory evidence gate: no company + no signal = discard.
-                if not (intent_hits or need_hits or trigger_hits or pain_hits):
-                    discarded += 1
-                    continue
-
-                companies.add(company)
-
-                row = cur.execute(
-                    "SELECT id FROM companies WHERE lower(name)=lower(?)", (company,)
-                ).fetchone()
-
-                if row:
-                    cid = row["id"]
-                    cur.execute(
-                        "UPDATE companies SET website=?,updated_at=? WHERE id=?",
-                        (final_url, now(), cid)
-                    )
-                else:
-                    cur.execute(
-                        "INSERT INTO companies(name,website,created_at,updated_at) VALUES(?,?,?,?)",
-                        (company, final_url, now(), now())
-                    )
-                    cid = cur.lastrowid
-
-                cur.execute(
-                    """INSERT OR IGNORE INTO sources
-                    (company_id,title,url,collected_at,content)
-                    VALUES(?,?,?,?,?)""",
-                    (cid, article_title, final_url, now(), body[:40000])
-                )
-                sid_row = cur.execute(
-                    "SELECT id FROM sources WHERE url=?", (final_url,)
-                ).fetchone()
-                sid = sid_row["id"]
-
-                intent_level, need_level, pain_level, timing_level, dm_level, score, confidence, cls = classify(
-                    len(intent_hits), len(need_hits), len(pain_hits), len(trigger_hits), bool(dm_hits)
-                )
-
-                ev_intent = best_evidence(combined, INTENT_TERMS)
-                ev_need = best_evidence(combined, NEED_TERMS)
-                ev_trigger = best_evidence(combined, TRIGGER_TERMS)
-                ev_pain = best_evidence(combined, PAIN_TERMS)
-
-                evidence_rows = []
-                if ev_intent:
-                    evidence_rows.append(("BUYING_INTENT", ev_intent[0]))
-                if ev_need:
-                    evidence_rows.append(("NEED_SIGNAL", ev_need[0]))
-                if ev_trigger:
-                    evidence_rows.append(("BUSINESS_TRIGGER", ev_trigger[0]))
-                if ev_pain:
-                    evidence_rows.append(("PAIN_RISK", ev_pain[0]))
-
-                for kind, ev in evidence_rows:
-                    cur.execute(
-                        """INSERT OR IGNORE INTO signals
-                        (company_id,source_id,kind,evidence,evidence_type,created_at)
-                        VALUES(?,?,?,?,?,?)""",
-                        (cid, sid, kind, ev, "FACT", now())
-                    )
-
-                reason = (
-                    f"ICP FIT: UNKNOWN (7/15). "
-                    f"Buying Intent: {intent_level}. "
-                    f"Need Signal: {need_level}. "
-                    f"Pain/Risk: {pain_level}. "
-                    f"Timing: {timing_level}. "
-                    f"Decision Maker: {dm_level}. "
-                    f"Fonte: {publisher or 'não informado'}."
-                )
-
-                next_action = {
-                    "HOT": "Abordar rapidamente o decisor e validar o processo de compra.",
-                    "WARM": "Abordagem consultiva baseada na evidência; confirmar necessidade e intenção.",
-                    "WATCH": "Monitorar o sinal e buscar evidência adicional antes de abordagem.",
-                    "IGNORE": "Não abordar; evidência insuficiente."
-                }[cls]
-
-                old = cur.execute(
-                    "SELECT id FROM opportunities WHERE company_id=?", (cid,)
-                ).fetchone()
-
-                cur.execute(
-                    """INSERT INTO opportunities
-                    (company_id,trigger_text,need,pain,intent,dm,timing,score,
-                     confidence,classification,next_action,reason,created_at,updated_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT(company_id) DO UPDATE SET
-                    trigger_text=excluded.trigger_text, need=excluded.need,
-                    pain=excluded.pain, intent=excluded.intent, dm=excluded.dm,
-                    timing=excluded.timing, score=excluded.score,
-                    confidence=excluded.confidence, classification=excluded.classification,
-                    next_action=excluded.next_action, reason=excluded.reason,
-                    updated_at=excluded.updated_at""",
-                    (
-                        cid,
-                        trigger_hits[0] if trigger_hits else "UNKNOWN",
-                        need_level, pain_level, intent_level, dm_level, timing_level,
-                        score, confidence, cls, next_action, reason, now(), now()
-                    )
-                )
-
-                if cls == "IGNORE":
-                    discarded += 1
-                elif old:
-                    updated += 1
-                else:
-                    new_opps += 1
-                con.commit()
-
-        cur.execute(
-            """UPDATE hunts SET finished_at=?,status=?,companies=?,new_opps=?,
-               updated_opps=?,discarded=? WHERE id=?""",
-            (now(),"COMPLETED",len(companies),new_opps,updated,discarded,hunt_id)
-        )
-        con.commit()
-        return hunt_id, len(companies), new_opps, updated, discarded, sources_found
-
+        # MILO: breadth first. Qualification happens only after collection.
+        for q in QUERIES:
+            for item in rss_search(q):
+                if item["url"] not in seen: seen.add(item["url"]); raw.append(item)
+        for item in pncp_search(max_pages=3):
+            k=item["url"]+"|"+item["title"][:100]
+            if k not in seen: seen.add(k); raw.append(item)
+        sources_found=len(raw)
+        for item in raw:
+            desc=BeautifulSoup(item.get("description",""),"html.parser").get_text(" ",strip=True)
+            page_title,page_text,final_url=fetch_page(item.get("url",""))
+            title=page_title or strip_publisher(item.get("title",""),item.get("publisher","")); body=page_text or desc
+            combined=clean_text(title+" "+desc+" "+body)
+            for terms in (INTENT_TERMS,NEED_TERMS,TRIGGER_TERMS,PAIN_TERMS):
+                if term_hits(combined,terms): signals_found+=1
+            company=extract_company(title,body,item.get("publisher",""),item.get("company_candidate"))
+            if not company:
+                discarded+=1; continue
+            companies.add(company)
+            row=cur.execute("SELECT id FROM companies WHERE lower(name)=lower(?)",(company,)).fetchone()
+            if row: cid=row["id"]; cur.execute("UPDATE companies SET website=?,updated_at=? WHERE id=?",(final_url,now(),cid))
+            else: cur.execute("INSERT INTO companies(name,website,created_at,updated_at) VALUES(?,?,?,?)",(company,final_url,now(),now())); cid=cur.lastrowid
+            cur.execute("INSERT OR IGNORE INTO sources(company_id,title,url,source_type,publisher,collected_at,content) VALUES(?,?,?,?,?,?,?)",(cid,title,final_url,item.get("source_type","NOTICIA"),item.get("publisher",""),now(),body[:40000]))
+            sid=cur.execute("SELECT id FROM sources WHERE url=?",(final_url,)).fetchone()["id"]
+            for kind,terms in (("BUYING_INTENT",INTENT_TERMS),("NEED_SIGNAL",NEED_TERMS),("BUSINESS_TRIGGER",TRIGGER_TERMS),("PAIN_RISK",PAIN_TERMS)):
+                ev=best_evidence(combined,terms)
+                if ev: cur.execute("INSERT OR IGNORE INTO signals(company_id,source_id,kind,evidence,evidence_type,created_at) VALUES(?,?,?,?,?,?)",(cid,sid,kind,ev[0],"FACT",now()))
+            ih=term_hits(combined,INTENT_TERMS); nh=term_hits(combined,NEED_TERMS); th=term_hits(combined,TRIGGER_TERMS); ph=term_hits(combined,PAIN_TERMS); dh=term_hits(combined,DM_TERMS)
+            # Trigger alone remains a signal; it cannot create an opportunity.
+            if not (ih or nh or ph): discarded+=1; con.commit(); continue
+            intent_level,need_level,pain_level,timing_level,dm_level,score,confidence,cls=classify(len(ih),len(nh),len(ph),len(th),bool(dh))
+            if item.get("source_type")=="PNCP" and cls in ("HOT","WARM"): cls="WATCH"; confidence="HIGH"
+            reason=(f"ICP FIT: UNKNOWN (7/15). Buying Intent: {intent_level}. Need Signal: {need_level}. Pain/Risk: {pain_level}. Timing: {timing_level}. Decision Maker: {dm_level}. Fonte: {item.get('publisher') or item.get('source_type','NOTICIA')} ({item.get('source_type','NOTICIA')}).")
+            next_action={"HOT":"Abordar rapidamente o decisor e validar processo de compra, escopo e prazo.","WARM":"Abordagem consultiva baseada na evidência; confirmar necessidade, intenção e ICP.","WATCH":"Investigar/enriquecer o sinal antes da abordagem; buscar segunda evidência independente.","IGNORE":"Não abordar; evidência insuficiente."}[cls]
+            old=cur.execute("SELECT id FROM opportunities WHERE company_id=?",(cid,)).fetchone()
+            cur.execute("""INSERT INTO opportunities(company_id,trigger_text,need,pain,intent,dm,timing,score,confidence,classification,next_action,reason,created_at,updated_at)
+              VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(company_id) DO UPDATE SET trigger_text=excluded.trigger_text,need=excluded.need,pain=excluded.pain,intent=excluded.intent,dm=excluded.dm,timing=excluded.timing,score=excluded.score,confidence=excluded.confidence,classification=excluded.classification,next_action=excluded.next_action,reason=excluded.reason,updated_at=excluded.updated_at""",
+              (cid,th[0] if th else "UNKNOWN",need_level,pain_level,intent_level,dm_level,timing_level,score,confidence,cls,next_action,reason,now(),now()))
+            if cls=="IGNORE": discarded+=1
+            elif old: updated+=1
+            else: new_opps+=1
+            con.commit()
+        cur.execute("UPDATE hunts SET finished_at=?,status=?,sources_found=?,signals_found=?,companies=?,new_opps=?,updated_opps=?,discarded=? WHERE id=?",(now(),"COMPLETED",sources_found,signals_found,len(companies),new_opps,updated,discarded,hunt_id)); con.commit()
+        return hunt_id,sources_found,signals_found,len(companies),new_opps,updated,discarded
     except Exception:
-        cur.execute(
-            "UPDATE hunts SET finished_at=?,status=? WHERE id=?",
-            (now(),"FAILED",hunt_id)
-        )
-        con.commit()
-        raise
-    finally:
-        con.close()
+        cur.execute("UPDATE hunts SET finished_at=?,status=? WHERE id=?",(now(),"FAILED",hunt_id)); con.commit(); raise
+    finally: con.close()
 
 def opportunities():
     con = get_db()
@@ -557,22 +404,24 @@ def evidence(oid):
     return rows
 
 st.title("🔎 HUNTER TECHS")
-st.caption("Opportunity Intelligence Radar — CAÇA REAL • V6 — evidência antes da oportunidade")
+st.caption("Opportunity Intelligence Radar — CAÇA REAL • V7 — MILO lê sinais | HUNTER peneira oportunidades")
 
 con = get_db()
 stats = [
     con.execute("SELECT COUNT(*) AS total FROM companies").fetchone()["total"],
+    con.execute("SELECT COUNT(*) AS total FROM signals").fetchone()["total"],
     con.execute("SELECT COUNT(*) AS total FROM opportunities WHERE classification!='IGNORE'").fetchone()["total"],
     con.execute("SELECT COUNT(*) AS total FROM opportunities WHERE classification='HOT'").fetchone()["total"],
     con.execute("SELECT COUNT(*) AS total FROM opportunities WHERE classification='WARM'").fetchone()["total"],
 ]
 con.close()
 
-a,b,c,d = st.columns(4)
+a,b,c,d,e = st.columns(5)
 a.metric("Empresas", stats[0])
-b.metric("Oportunidades", stats[1])
-c.metric("HOT", stats[2])
-d.metric("WARM", stats[3])
+b.metric("Sinais", stats[1])
+c.metric("Oportunidades", stats[2])
+d.metric("HOT", stats[3])
+e.metric("WARM", stats[4])
 
 if st.button("🔎 IR PARA CAÇA", type="primary", use_container_width=True):
     with st.spinner("Executando caça real via fontes públicas..."):
@@ -580,9 +429,8 @@ if st.button("🔎 IR PARA CAÇA", type="primary", use_container_width=True):
             result = run_hunt()
             st.success(
                 f"Caça #{result[0]} concluída — "
-                f"{result[1]} empresas | {result[2]} novas | "
-                f"{result[3]} atualizadas | {result[4]} descartadas | "
-                f"{result[5]} fontes encontradas."
+                f"{result[1]} fontes | {result[2]} sinais | {result[3]} empresas | "
+                f"{result[4]} novas | {result[5]} atualizadas | {result[6]} descartadas."
             )
         except Exception as ex:
             st.error(f"Erro na caça: {ex}")
