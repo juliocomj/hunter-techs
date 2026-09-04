@@ -38,26 +38,63 @@ def now():
 def get_db():
     c = sqlite3.connect(DB)
     c.row_factory = sqlite3.Row
+
+    # Compatibility check: an older hunter.db may have an incompatible schema.
+    required = {
+        "companies": {"id","name","website","icp","created_at","updated_at"},
+        "sources": {"id","company_id","title","url","collected_at","content"},
+        "signals": {"id","company_id","source_id","kind","evidence","evidence_type","created_at"},
+        "opportunities": {"id","company_id","trigger_text","need","pain","intent","dm",
+                          "timing","score","confidence","classification","next_action",
+                          "reason","created_at","updated_at"},
+        "hunts": {"id","started_at","finished_at","status","companies","new_opps",
+                  "updated_opps","discarded"},
+    }
+
+    rebuild = False
+    for table, columns in required.items():
+        exists = c.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        if exists:
+            actual = {r["name"] for r in c.execute(f"PRAGMA table_info({table})").fetchall()}
+            if not columns.issubset(actual):
+                rebuild = True
+
+    if rebuild:
+        c.executescript("""
+        DROP TABLE IF EXISTS signals;
+        DROP TABLE IF EXISTS sources;
+        DROP TABLE IF EXISTS opportunities;
+        DROP TABLE IF EXISTS companies;
+        DROP TABLE IF EXISTS hunts;
+        """)
+
     c.executescript("""
     CREATE TABLE IF NOT EXISTS companies(
       id INTEGER PRIMARY KEY, name TEXT UNIQUE, website TEXT,
       icp TEXT DEFAULT 'UNKNOWN', created_at TEXT, updated_at TEXT);
+
     CREATE TABLE IF NOT EXISTS sources(
       id INTEGER PRIMARY KEY, company_id INTEGER, title TEXT, url TEXT UNIQUE,
       collected_at TEXT, content TEXT);
+
     CREATE TABLE IF NOT EXISTS signals(
       id INTEGER PRIMARY KEY, company_id INTEGER, source_id INTEGER, kind TEXT,
       evidence TEXT, evidence_type TEXT, created_at TEXT,
       UNIQUE(company_id,source_id,kind,evidence));
+
     CREATE TABLE IF NOT EXISTS opportunities(
       id INTEGER PRIMARY KEY, company_id INTEGER UNIQUE, trigger_text TEXT,
       need TEXT, pain TEXT, intent TEXT, dm TEXT, timing TEXT, score INTEGER,
       confidence TEXT, classification TEXT, next_action TEXT, reason TEXT,
       created_at TEXT, updated_at TEXT);
+
     CREATE TABLE IF NOT EXISTS hunts(
       id INTEGER PRIMARY KEY, started_at TEXT, finished_at TEXT, status TEXT,
       companies INTEGER, new_opps INTEGER, updated_opps INTEGER, discarded INTEGER);
     """)
+    c.commit()
     return c
 
 def rss_search(query):
@@ -308,7 +345,7 @@ st.caption("Opportunity Intelligence Radar — CAÇA REAL")
 
 con = get_db()
 stats = [
-    con.execute("SELECT COUNT(*) n FROM companies").fetchone()["n"],
+    con.execute("SELECT COUNT(*) AS total FROM companies").fetchone()["total"],
     con.execute("SELECT COUNT(*) n FROM opportunities WHERE classification!='IGNORE'").fetchone()["n"],
     con.execute("SELECT COUNT(*) n FROM opportunities WHERE classification='HOT'").fetchone()["n"],
     con.execute("SELECT COUNT(*) n FROM opportunities WHERE classification='WARM'").fetchone()["n"],
