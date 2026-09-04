@@ -1,5 +1,5 @@
 import streamlit as st
-import sqlite3, re, requests, pandas as pd, io
+import sqlite3, requests, pandas as pd, io, re, hashlib
 from bs4 import BeautifulSoup
 from datetime import datetime
 from urllib.parse import quote_plus, urlparse
@@ -7,30 +7,75 @@ from urllib.parse import quote_plus, urlparse
 st.set_page_config(page_title="HUNTER TECHS", page_icon="🔎", layout="wide")
 
 DB = "hunter.db"
-HEADERS = {"User-Agent": "Mozilla/5.0 TECHS-Hunter/2.0"}
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/126 Safari/537.36 TECHS-Hunter/5.0"
+}
 
+# The Hunter searches for observable commercial/operational signals.
+# It does NOT treat a generic technology mention as buying intent.
 QUERIES = [
-    '"RFP" "segurança da informação" Brasil',
-    '"cotação" "segurança da informação" Brasil',
-    '"solicitação de proposta" TI Brasil',
+    '"RFP" "segurança da informação" empresa Brasil',
+    '"RFQ" "tecnologia da informação" empresa Brasil',
+    '"solicitação de proposta" "TI" empresa Brasil',
+    '"cotação" "serviços de TI" empresa Brasil',
     '"contratação" "serviços gerenciados" TI Brasil',
+    '"contratação" "segurança cibernética" empresa Brasil',
     '"novo CIO" empresa Brasil',
     '"novo CTO" empresa Brasil',
     '"novo gerente de TI" empresa Brasil',
     '"migração para cloud" empresa Brasil',
-    '"transformação digital" infraestrutura empresa Brasil',
+    '"transformação digital" "infraestrutura de TI" empresa Brasil',
+    '"incidente de segurança" empresa Brasil',
 ]
 
-TRIGGERS = ["novo cio","novo cto","novo diretor","novo gerente de ti","expansão",
-"aquisição","nova unidade","nova filial","crescimento","transformação digital",
-"migração","cloud","implantação de erp","incidente de segurança","reestruturação de ti"]
-NEEDS = ["rmm","edr","backup","segurança","monitoramento","endpoint","firewall",
-"sase","serviços gerenciados","infraestrutura","cloud","nuvem","cybersecurity",
-"continuidade","governança"]
-INTENTS = ["rfp","rfq","solicitação de proposta","cotação","busca de fornecedor",
-"processo de contratação","contratação de serviço","troca de fornecedor",
-"busca de parceiro","request for proposal","request for quotation"]
-DMS = ["diretor de ti","diretor de tecnologia","cio","cto","gerente de ti"]
+INTENT_TERMS = [
+    "rfp", "rfq", "request for proposal", "request for quotation",
+    "solicitação de proposta", "solicitação de cotação", "solicitação de orçamento",
+    "cotação", "orçamento", "processo de contratação", "processo de compras",
+    "contratação de fornecedor", "busca de fornecedor", "busca por fornecedor",
+    "seleção de fornecedor", "convidou fornecedores", "fornecedores interessados",
+    "licitação", "edital", "pregão", "concorrência", "tomada de preços",
+    "troca de fornecedor", "busca de parceiro"
+]
+
+NEED_TERMS = [
+    "rmm", "edr", "backup", "segurança da informação", "segurança cibernética",
+    "cybersecurity", "monitoramento de infraestrutura", "monitoramento de ti",
+    "gestão de endpoints", "endpoint", "firewall", "sase", "serviços gerenciados",
+    "managed services", "infraestrutura de ti", "infraestrutura tecnológica",
+    "cloud", "nuvem", "continuidade", "disaster recovery", "recuperação de desastre",
+    "governança de ti", "observabilidade", "soc", "mssp"
+]
+
+TRIGGER_TERMS = [
+    "novo cio", "novo cto", "novo diretor de ti", "novo diretor de tecnologia",
+    "novo gerente de ti", "novo responsável por ti", "expansão", "nova unidade",
+    "nova filial", "aquisição", "fusão", "crescimento", "transformação digital",
+    "migração para cloud", "migração para nuvem", "implantação de erp",
+    "incidente de segurança", "ataque cibernético", "reestruturação de ti",
+    "modernização da infraestrutura"
+]
+
+PAIN_TERMS = [
+    "indisponibilidade", "downtime", "parada", "falha", "incidente",
+    "ataque", "vulnerabilidade", "risco", "interrupção", "perda de dados",
+    "vazamento", "ransomware", "continuidade", "obsolescência", "falta de equipe",
+    "sobrecarga", "24x7", "tempo de resposta"
+]
+
+DM_TERMS = [
+    "cio", "cto", "diretor de ti", "diretor de tecnologia",
+    "gerente de ti", "gerente de tecnologia", "head de tecnologia",
+    "diretor de infraestrutura", "diretor de segurança"
+]
+
+GENERIC_COMPANIES = {
+    "google news", "google", "youtube", "facebook", "linkedin", "reuters",
+    "exame", "valor", "estadao", "estadião", "folha", "globo", "uol",
+    "terra", "cnn", "forbes", "g1", "canaltech", "tecmundo", "olhar digital",
+    "infomoney", "istoé", "isto é", "estadão", "news"
+}
 
 def now():
     return datetime.now().isoformat(timespec="seconds")
@@ -39,7 +84,6 @@ def get_db():
     c = sqlite3.connect(DB)
     c.row_factory = sqlite3.Row
 
-    # Compatibility check: an older hunter.db may have an incompatible schema.
     required = {
         "companies": {"id","name","website","icp","created_at","updated_at"},
         "sources": {"id","company_id","title","url","collected_at","content"},
@@ -97,22 +141,35 @@ def get_db():
     c.commit()
     return c
 
+def clean_text(x):
+    return re.sub(r"\s+", " ", x or "").strip()
+
+def term_hits(text, terms):
+    low = (text or "").lower()
+    return [t for t in terms if t in low]
+
 def rss_search(query):
-    """Uses public Google News RSS instead of scraping a search-result HTML page."""
-    url = "https://news.google.com/rss/search?q=" + quote_plus(query) + "&hl=pt-BR&gl=BR&ceid=BR:pt-419"
+    url = (
+        "https://news.google.com/rss/search?q=" + quote_plus(query) +
+        "&hl=pt-BR&gl=BR&ceid=BR:pt-419"
+    )
     try:
         r = requests.get(url, headers=HEADERS, timeout=20)
         r.raise_for_status()
         soup = BeautifulSoup(r.content, "xml")
         items = []
         for item in soup.find_all("item"):
-            title = item.title.get_text(" ", strip=True) if item.title else ""
+            title = clean_text(item.title.get_text(" ", strip=True) if item.title else "")
             link = item.link.get_text(strip=True) if item.link else ""
-            pub = item.pubDate.get_text(strip=True) if item.pubDate else ""
-            source = item.source.get_text(" ", strip=True) if item.source else ""
+            desc = clean_text(item.description.get_text(" ", strip=True) if item.description else "")
+            pub = clean_text(item.pubDate.get_text(" ", strip=True) if item.pubDate else "")
+            source = clean_text(item.source.get_text(" ", strip=True) if item.source else "")
             if link:
-                items.append({"title": title, "url": link, "published": pub, "source": source})
-        return items[:12]
+                items.append({
+                    "title": title, "url": link, "description": desc,
+                    "published": pub, "publisher": source
+                })
+        return items[:15]
     except Exception:
         return []
 
@@ -121,37 +178,128 @@ def fetch_page(url):
         r = requests.get(url, headers=HEADERS, timeout=20, allow_redirects=True)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
-        for x in soup(["script","style","noscript"]):
+        for x in soup(["script","style","noscript","svg"]):
             x.decompose()
-        title = soup.title.get_text(" ", strip=True) if soup.title else ""
-        text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
-        return title, text[:100000], r.url
+        title = clean_text(soup.title.get_text(" ", strip=True) if soup.title else "")
+        text = clean_text(soup.get_text(" ", strip=True))
+        return title, text[:120000], r.url
     except Exception:
         return None, None, url
 
-def hits(text, terms):
-    t = (text or "").lower()
-    return [x for x in terms if x in t]
+def strip_publisher(title, publisher):
+    t = clean_text(title)
+    if publisher:
+        # Google News commonly returns "headline - publisher".
+        t = re.sub(r"\s+[-|–—]\s+" + re.escape(publisher) + r"\s*$", "", t, flags=re.I)
+    return t
 
-def extract_company(title, text):
-    # Prefer an explicit company-name pattern from the article title.
-    if not title:
-        return None
-    parts = re.split(r"\s[-|–—:]\s", title)
-    candidate = parts[0].strip()
-    if 2 <= len(candidate.split()) <= 10 and len(candidate) <= 120:
-        return candidate
+def valid_company(name):
+    if not name:
+        return False
+    n = clean_text(name).strip(" -–—:,.")
+    low = n.lower()
+    if low in GENERIC_COMPANIES:
+        return False
+    if any(low == g or low.startswith(g + " ") for g in GENERIC_COMPANIES):
+        return False
+    if len(n) < 3 or len(n) > 100:
+        return False
+    words = n.split()
+    if not (1 <= len(words) <= 9):
+        return False
+    if re.fullmatch(r"[0-9 .,%/-]+", n):
+        return False
+    return True
+
+def extract_company(title, body, publisher):
+    """
+    Conservative company extraction. A candidate is accepted only when it is
+    supported by a company-context phrase or a strong headline pattern.
+    Never uses the publisher/source name as the company.
+    """
+    t = strip_publisher(title, publisher)
+    text = clean_text(t + " " + (body or "")[:50000])
+
+    patterns = [
+        # "na Empresa X", "no Grupo X", "da Empresa X"
+        r"\b(?:na|no|da|do|em|de|para a|para o)\s+(?:empresa|grupo|companhia|holding)\s+([A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'-]*(?:\s+[A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'-]*){0,6})",
+        # "Empresa X" / "Grupo X"
+        r"\b(?:empresa|grupo|companhia|holding)\s+([A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'-]*(?:\s+[A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'-]*){0,6})",
+        # Common "X anuncia / X contrata / X busca / X inicia"
+        r"^([A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'-]*(?:\s+[A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'-]*){0,5})\s+(?:anuncia|contrata|busca|procura|inicia|investe|expande|adota|implementa|migra|seleciona|abre|lança)\b",
+    ]
+
+    candidates = []
+    for p in patterns:
+        for m in re.finditer(p, text):
+            c = clean_text(m.group(1)).strip(" ,.;:()[]")
+            if valid_company(c):
+                candidates.append(c)
+
+    if not candidates:
+        # Headline heuristic: only accept a capitalized leading phrase when the
+        # headline itself contains a commercial trigger.
+        low = t.lower()
+        trigger_words = ["contrata", "busca", "procura", "expande", "investe",
+                         "migra", "implementa", "adota", "anuncia", "seleciona"]
+        if any(w in low for w in trigger_words):
+            m = re.match(
+                r"^([A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'-]*(?:\s+[A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'-]*){0,5})\s+",
+                t
+            )
+            if m and valid_company(m.group(1)):
+                candidates.append(clean_text(m.group(1)))
+
+    # Prefer the shortest high-quality candidate. Avoid generic "Empresa".
+    if candidates:
+        candidates = sorted(set(candidates), key=lambda x: (len(x.split()), len(x)))
+        return candidates[0]
     return None
 
-def calculate(intent, need, pain, timing, dm):
-    raw = 7
-    raw += 25 if intent == "HIGH" else 0
-    raw += 20 if need == "HIGH" else 0
-    raw += 12 if pain == "MEDIUM" else 0
-    raw += 10 if timing == "HIGH" else 0
-    raw += 7 if dm == "LIKELY" else 0
-    cap = {"NONE":30,"LOW":55,"MEDIUM":75,"HIGH":90,"VERY HIGH":100}[intent]
-    return min(raw, cap)
+def best_evidence(text, terms):
+    sentences = re.split(r"(?<=[.!?])\s+", clean_text(text))
+    scored = []
+    for s in sentences:
+        low = s.lower()
+        if 45 <= len(s) <= 900:
+            hits = sum(1 for term in terms if term in low)
+            if hits:
+                scored.append((hits, s))
+    scored.sort(key=lambda x: (-x[0], len(x[1])))
+    return [s for _, s in scored[:5]]
+
+def classify(intent, need, pain, trigger, dm):
+    # Buying intent is the hard gate. A technology mention alone cannot create HOT/WARM.
+    intent_level = "VERY HIGH" if intent >= 3 else ("HIGH" if intent == 2 else ("MEDIUM" if intent == 1 else "NONE"))
+    need_level = "HIGH" if need >= 2 else ("MEDIUM" if need == 1 else "NONE")
+    pain_level = "HIGH" if pain >= 2 else ("MEDIUM" if pain == 1 else "NONE")
+    timing_level = "HIGH" if trigger >= 2 else ("MEDIUM" if trigger == 1 else "NONE")
+    dm_level = "LIKELY" if dm else "NONE"
+
+    score = 7
+    score += {"NONE":0,"MEDIUM":12,"HIGH":20,"VERY HIGH":25}[intent_level]
+    score += {"NONE":0,"MEDIUM":11,"HIGH":20}[need_level]
+    score += {"NONE":0,"MEDIUM":10,"HIGH":20}[pain_level]
+    score += {"NONE":0,"MEDIUM":5,"HIGH":10}[timing_level]
+    score += 7 if dm_level == "LIKELY" else 0
+
+    cap = {"NONE":30,"MEDIUM":75,"HIGH":90,"VERY HIGH":100}.get(intent_level, 30)
+    score = min(score, cap)
+
+    # Strict classification.
+    if intent_level == "VERY HIGH" and need_level != "NONE" and score >= 75:
+        cls = "HOT"
+    elif intent_level in ("HIGH","VERY HIGH") and need_level != "NONE" and score >= 55:
+        cls = "WARM"
+    elif need_level != "NONE" or intent_level != "NONE" or pain_level != "NONE":
+        cls = "WATCH"
+    else:
+        cls = "IGNORE"
+
+    confidence = "HIGH" if intent_level in ("HIGH","VERY HIGH") and need_level != "NONE" else (
+        "MEDIUM" if intent_level != "NONE" or need_level != "NONE" or pain_level != "NONE" else "LOW"
+    )
+    return intent_level, need_level, pain_level, timing_level, dm_level, score, confidence, cls
 
 def run_hunt():
     con = get_db()
@@ -160,35 +308,49 @@ def run_hunt():
     hunt_id = cur.lastrowid
     con.commit()
 
-    urls = set()
+    seen_urls = set()
     companies = set()
     new_opps = updated = discarded = 0
+    sources_found = 0
 
     try:
         for query in QUERIES:
-            results = rss_search(query)
-            for item in results:
+            for item in rss_search(query):
                 url = item["url"]
-                if url in urls:
+                if url in seen_urls:
                     continue
-                urls.add(url)
+                seen_urls.add(url)
+                sources_found += 1
 
-                title, text, final_url = fetch_page(url)
-                if not text:
+                rss_title = item["title"]
+                publisher = item["publisher"]
+                rss_desc = BeautifulSoup(item["description"], "html.parser").get_text(" ", strip=True)
+
+                page_title, page_text, final_url = fetch_page(url)
+                article_title = page_title or strip_publisher(rss_title, publisher)
+                body = page_text or rss_desc
+                combined = clean_text(article_title + " " + rss_desc + " " + body)
+
+                company = extract_company(article_title, body, publisher)
+                if not company:
                     discarded += 1
                     continue
 
-                name = extract_company(title, text)
-                if not name:
-                    # Keep the source even when company extraction is inconclusive,
-                    # but do not manufacture an opportunity.
+                intent_hits = term_hits(combined, INTENT_TERMS)
+                need_hits = term_hits(combined, NEED_TERMS)
+                trigger_hits = term_hits(combined, TRIGGER_TERMS)
+                pain_hits = term_hits(combined, PAIN_TERMS)
+                dm_hits = term_hits(combined, DM_TERMS)
+
+                # Mandatory evidence gate: no company + no signal = discard.
+                if not (intent_hits or need_hits or trigger_hits or pain_hits):
                     discarded += 1
                     continue
 
-                companies.add(name)
+                companies.add(company)
 
                 row = cur.execute(
-                    "SELECT id FROM companies WHERE lower(name)=lower(?)", (name,)
+                    "SELECT id FROM companies WHERE lower(name)=lower(?)", (company,)
                 ).fetchone()
 
                 if row:
@@ -200,76 +362,64 @@ def run_hunt():
                 else:
                     cur.execute(
                         "INSERT INTO companies(name,website,created_at,updated_at) VALUES(?,?,?,?)",
-                        (name, final_url, now(), now())
+                        (company, final_url, now(), now())
                     )
                     cid = cur.lastrowid
 
                 cur.execute(
-                    """INSERT OR IGNORE INTO sources(company_id,title,url,collected_at,content)
-                       VALUES(?,?,?,?,?)""",
-                    (cid, title, final_url, now(), text[:30000])
+                    """INSERT OR IGNORE INTO sources
+                    (company_id,title,url,collected_at,content)
+                    VALUES(?,?,?,?,?)""",
+                    (cid, article_title, final_url, now(), body[:40000])
                 )
-                sid = cur.execute(
+                sid_row = cur.execute(
                     "SELECT id FROM sources WHERE url=?", (final_url,)
-                ).fetchone()["id"]
+                ).fetchone()
+                sid = sid_row["id"]
 
-                tr = hits(text, TRIGGERS)
-                ne = hits(text, NEEDS)
-                it = hits(text, INTENTS)
+                intent_level, need_level, pain_level, timing_level, dm_level, score, confidence, cls = classify(
+                    len(intent_hits), len(need_hits), len(pain_hits), len(trigger_hits), bool(dm_hits)
+                )
 
-                sentences = re.split(r"(?<=[.!?])\s+", text)
-                evidence = [
-                    s.strip() for s in sentences
-                    if 35 <= len(s) <= 700
-                    and any(k in s.lower() for k in TRIGGERS + NEEDS + INTENTS + DMS)
-                ][:8]
+                ev_intent = best_evidence(combined, INTENT_TERMS)
+                ev_need = best_evidence(combined, NEED_TERMS)
+                ev_trigger = best_evidence(combined, TRIGGER_TERMS)
+                ev_pain = best_evidence(combined, PAIN_TERMS)
 
-                for ev in evidence:
-                    kind = (
-                        "BUYING_INTENT" if any(k in ev.lower() for k in INTENTS)
-                        else "BUSINESS_TRIGGER" if any(k in ev.lower() for k in TRIGGERS)
-                        else "NEED_SIGNAL"
-                    )
+                evidence_rows = []
+                if ev_intent:
+                    evidence_rows.append(("BUYING_INTENT", ev_intent[0]))
+                if ev_need:
+                    evidence_rows.append(("NEED_SIGNAL", ev_need[0]))
+                if ev_trigger:
+                    evidence_rows.append(("BUSINESS_TRIGGER", ev_trigger[0]))
+                if ev_pain:
+                    evidence_rows.append(("PAIN_RISK", ev_pain[0]))
+
+                for kind, ev in evidence_rows:
                     cur.execute(
                         """INSERT OR IGNORE INTO signals
-                           (company_id,source_id,kind,evidence,evidence_type,created_at)
-                           VALUES(?,?,?,?,?,?)""",
+                        (company_id,source_id,kind,evidence,evidence_type,created_at)
+                        VALUES(?,?,?,?,?,?)""",
                         (cid, sid, kind, ev, "FACT", now())
                     )
 
-                intent = "HIGH" if it else "NONE"
-                need = "HIGH" if ne else "NONE"
-                pain = "MEDIUM" if tr and ne else "NONE"
-                timing = "HIGH" if tr else "NONE"
-                dm = "LIKELY" if any(k in text.lower() for k in DMS) else "NONE"
-                sc = calculate(intent, need, pain, timing, dm)
-                confidence = "HIGH" if it and ne else ("MEDIUM" if it or ne else "LOW")
-
-                if not evidence:
-                    classification = "IGNORE"
-                elif sc >= 75 and intent == "HIGH":
-                    classification = "HOT"
-                elif sc >= 55 and intent in ("MEDIUM","HIGH","VERY HIGH"):
-                    classification = "WARM"
-                elif sc >= 30:
-                    classification = "WATCH"
-                else:
-                    classification = "IGNORE"
-
-                action = {
-                    "HOT": "Abordar o decisor usando a evidência e validar a dor.",
-                    "WARM": "Fazer abordagem consultiva e confirmar necessidade/intenção.",
-                    "WATCH": "Monitorar novos sinais antes de abordagem.",
-                    "IGNORE": "Não abordar; evidência insuficiente."
-                }[classification]
-
                 reason = (
-                    f"ICP 7/15; Intent {25 if intent=='HIGH' else 0}/25; "
-                    f"Need {20 if need=='HIGH' else 0}/20; "
-                    f"Pain {12 if pain=='MEDIUM' else 0}/20; "
-                    f"Timing {10 if timing=='HIGH' else 0}/10; "
-                    f"DM {7 if dm=='LIKELY' else 0}/10."
+                    f"ICP FIT: UNKNOWN (7/15). "
+                    f"Buying Intent: {intent_level}. "
+                    f"Need Signal: {need_level}. "
+                    f"Pain/Risk: {pain_level}. "
+                    f"Timing: {timing_level}. "
+                    f"Decision Maker: {dm_level}. "
+                    f"Fonte: {publisher or 'não informado'}."
                 )
+
+                next_action = {
+                    "HOT": "Abordar rapidamente o decisor e validar o processo de compra.",
+                    "WARM": "Abordagem consultiva baseada na evidência; confirmar necessidade e intenção.",
+                    "WATCH": "Monitorar o sinal e buscar evidência adicional antes de abordagem.",
+                    "IGNORE": "Não abordar; evidência insuficiente."
+                }[cls]
 
                 old = cur.execute(
                     "SELECT id FROM opportunities WHERE company_id=?", (cid,)
@@ -288,12 +438,14 @@ def run_hunt():
                     next_action=excluded.next_action, reason=excluded.reason,
                     updated_at=excluded.updated_at""",
                     (
-                        cid, tr[0] if tr else "UNKNOWN", need, pain, intent, dm,
-                        timing, sc, confidence, classification, action, reason, now(), now()
+                        cid,
+                        trigger_hits[0] if trigger_hits else "UNKNOWN",
+                        need_level, pain_level, intent_level, dm_level, timing_level,
+                        score, confidence, cls, next_action, reason, now(), now()
                     )
                 )
 
-                if classification == "IGNORE":
+                if cls == "IGNORE":
                     discarded += 1
                 elif old:
                     updated += 1
@@ -307,7 +459,7 @@ def run_hunt():
             (now(),"COMPLETED",len(companies),new_opps,updated,discarded,hunt_id)
         )
         con.commit()
-        return hunt_id, len(companies), new_opps, updated, discarded, len(urls)
+        return hunt_id, len(companies), new_opps, updated, discarded, sources_found
 
     except Exception:
         cur.execute(
@@ -333,7 +485,8 @@ def evidence(oid):
     con = get_db()
     rows = con.execute(
         """SELECT s.kind,s.evidence,src.title,src.url,src.collected_at
-           FROM signals s JOIN sources src ON src.id=s.source_id
+           FROM signals s
+           JOIN sources src ON src.id=s.source_id
            JOIN opportunities o ON o.company_id=s.company_id
            WHERE o.id=? ORDER BY src.collected_at DESC""", (oid,)
     ).fetchall()
@@ -346,9 +499,9 @@ st.caption("Opportunity Intelligence Radar — CAÇA REAL")
 con = get_db()
 stats = [
     con.execute("SELECT COUNT(*) AS total FROM companies").fetchone()["total"],
-    con.execute("SELECT COUNT(*) n FROM opportunities WHERE classification!='IGNORE'").fetchone()["n"],
-    con.execute("SELECT COUNT(*) n FROM opportunities WHERE classification='HOT'").fetchone()["n"],
-    con.execute("SELECT COUNT(*) n FROM opportunities WHERE classification='WARM'").fetchone()["n"],
+    con.execute("SELECT COUNT(*) AS total FROM opportunities WHERE classification!='IGNORE'").fetchone()["total"],
+    con.execute("SELECT COUNT(*) AS total FROM opportunities WHERE classification='HOT'").fetchone()["total"],
+    con.execute("SELECT COUNT(*) AS total FROM opportunities WHERE classification='WARM'").fetchone()["total"],
 ]
 con.close()
 
@@ -389,19 +542,21 @@ for o in opportunities():
 
         st.write(
             f"**ICP:** {o['icp']} | **Intent:** {o['intent']} | "
-            f"**Need:** {o['need']} | **Timing:** {o['timing']}"
+            f"**Need:** {o['need']} | **Pain/Risk:** {o['pain']} | "
+            f"**Timing:** {o['timing']}"
         )
         st.write(
-            f"**Trigger:** {o['trigger_text']} | **Pain/Risk:** {o['pain']} | "
-            f"**Decision Maker:** {o['dm']}"
+            f"**Trigger:** {o['trigger_text']} | **Decision Maker:** {o['dm']}"
         )
         st.write(f"**Próxima ação:** {o['next_action']}")
 
-        with st.expander("Evidências"):
+        with st.expander("Evidências rastreáveis"):
             st.write(o["reason"])
             for v in evidence(o["id"]):
                 st.markdown(f"- **{v['kind']} / FACT:** {v['evidence']}")
-                st.caption(f"{v['title']} — {v['url']} | coletada {v['collected_at']}")
+                st.caption(
+                    f"{v['title']} — {v['url']} | coletada {v['collected_at']}"
+                )
 
 st.divider()
 st.subheader("Exportação")
