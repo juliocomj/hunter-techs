@@ -199,7 +199,7 @@ def run_hunt():
                     )
                 else:
                     cur.execute(
-                        "INSERT INTO companies(name,website,created_at,updated_at) VALUES(?,?,?,?,?)",
+                        "INSERT INTO companies(name,website,created_at,updated_at) VALUES(?,?,?,?)",
                         (name, final_url, now(), now())
                     )
                     cid = cur.lastrowid
