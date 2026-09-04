@@ -138,6 +138,27 @@ def get_db():
       id INTEGER PRIMARY KEY, started_at TEXT, finished_at TEXT, status TEXT,
       companies INTEGER, new_opps INTEGER, updated_opps INTEGER, discarded INTEGER);
     """)
+    # V6 migration/cleanup: never allow a source/publisher to survive as a company.
+    placeholders = ",".join("?" * len(GENERIC_COMPANIES))
+    c.execute(
+        f"DELETE FROM opportunities WHERE company_id IN "
+        f"(SELECT id FROM companies WHERE lower(name) IN ({placeholders}))",
+        tuple(sorted(GENERIC_COMPANIES))
+    )
+    c.execute(
+        f"DELETE FROM signals WHERE company_id IN "
+        f"(SELECT id FROM companies WHERE lower(name) IN ({placeholders}))",
+        tuple(sorted(GENERIC_COMPANIES))
+    )
+    c.execute(
+        f"DELETE FROM sources WHERE company_id IN "
+        f"(SELECT id FROM companies WHERE lower(name) IN ({placeholders}))",
+        tuple(sorted(GENERIC_COMPANIES))
+    )
+    c.execute(
+        f"DELETE FROM companies WHERE lower(name) IN ({placeholders})",
+        tuple(sorted(GENERIC_COMPANIES))
+    )
     c.commit()
     return c
 
@@ -213,48 +234,87 @@ def valid_company(name):
 
 def extract_company(title, body, publisher):
     """
-    Conservative company extraction. A candidate is accepted only when it is
-    supported by a company-context phrase or a strong headline pattern.
-    Never uses the publisher/source name as the company.
+    V6 company extraction.
+
+    Priority:
+    1) explicit company/group/organization patterns;
+    2) headline subject before a strong business verb;
+    3) company name after "X anuncia/contrata/busca..." patterns.
+
+    The publisher is NEVER accepted as the company.
+    Generic media/source names are rejected.
     """
     t = strip_publisher(title, publisher)
-    text = clean_text(t + " " + (body or "")[:50000])
+    text = clean_text(t + " " + (body or "")[:30000])
 
-    patterns = [
-        # "na Empresa X", "no Grupo X", "da Empresa X"
-        r"\b(?:na|no|da|do|em|de|para a|para o)\s+(?:empresa|grupo|companhia|holding)\s+([A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'-]*(?:\s+[A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'-]*){0,6})",
-        # "Empresa X" / "Grupo X"
-        r"\b(?:empresa|grupo|companhia|holding)\s+([A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'-]*(?:\s+[A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'-]*){0,6})",
-        # Common "X anuncia / X contrata / X busca / X inicia"
-        r"^([A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'-]*(?:\s+[A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'-]*){0,5})\s+(?:anuncia|contrata|busca|procura|inicia|investe|expande|adota|implementa|migra|seleciona|abre|lança)\b",
-    ]
+    def add(c, out):
+        c = clean_text(c).strip(" -–—:,.()[]\"'")
+        # Remove leading grammatical noise.
+        c = re.sub(r"^(?:a|o|as|os)\s+", "", c, flags=re.I)
+        if valid_company(c) and c.lower() not in {x.lower() for x in out}:
+            out.append(c)
 
     candidates = []
-    for p in patterns:
+
+    # Strong explicit organization patterns.
+    explicit_patterns = [
+        r"\b(?:empresa|grupo|companhia|holding|organização|organizacao)\s+([A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'/-]*(?:\s+[A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'/-]*){0,7})",
+        r"\b(?:da|do|na|no|em)\s+(?:empresa|grupo|companhia|holding)\s+([A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'/-]*(?:\s+[A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'/-]*){0,7})"
+    ]
+    for p in explicit_patterns:
         for m in re.finditer(p, text):
-            c = clean_text(m.group(1)).strip(" ,.;:()[]")
-            if valid_company(c):
-                candidates.append(c)
+            add(m.group(1), candidates)
 
+    # Headline-oriented extraction. This is deliberately restricted to
+    # strong verbs so ordinary headlines don't become fake companies.
+    headline = t.split(" | ")[0].strip()
+    verb = (
+        r"(?:anuncia|anunciou|contrata|contratou|busca|buscou|procura|procurou|"
+        r"seleciona|selecionou|investe|investiu|expande|expandiu|abre|abriu|"
+        r"lança|lancou|lançou|adota|adotou|implementa|implementou|"
+        r"migra|migrou|inicia|iniciou|moderniza|modernizou|reestrutura|"
+        r"reestruturou|troca|trocou|vai contratar|pretende contratar)"
+    )
+    m = re.match(
+        rf"^\s*([A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'/-]*(?:\s+[A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'/-]*){{0,7}}?)\s+{verb}\b",
+        headline, flags=re.I
+    )
+    if m:
+        add(m.group(1), candidates)
+
+    # "X: ...", "X anuncia..." common business-news format.
     if not candidates:
-        # Headline heuristic: only accept a capitalized leading phrase when the
-        # headline itself contains a commercial trigger.
-        low = t.lower()
-        trigger_words = ["contrata", "busca", "procura", "expande", "investe",
-                         "migra", "implementa", "adota", "anuncia", "seleciona"]
-        if any(w in low for w in trigger_words):
-            m = re.match(
-                r"^([A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'-]*(?:\s+[A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'-]*){0,5})\s+",
-                t
-            )
-            if m and valid_company(m.group(1)):
-                candidates.append(clean_text(m.group(1)))
+        m = re.match(
+            r"^\s*([A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'/-]*(?:\s+[A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'/-]*){0,5})\s*[:\-–—]\s+",
+            headline
+        )
+        if m and any(v in headline.lower() for v in [
+            "segurança","tecnologia","ti","cloud","nuvem","infraestrutura",
+            "ciber","backup","dados","ransomware","contratação","fornecedor"
+        ]):
+            add(m.group(1), candidates)
 
-    # Prefer the shortest high-quality candidate. Avoid generic "Empresa".
-    if candidates:
-        candidates = sorted(set(candidates), key=lambda x: (len(x.split()), len(x)))
-        return candidates[0]
-    return None
+    # If body has "X, [cargo], ..." use the proper name only when followed
+    # by a company-context expression.
+    body_patterns = [
+        r"\b(?:na|no|da|do)\s+([A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'/-]*(?:\s+[A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'/-]*){0,5})\s*,",
+        r"\b([A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'/-]*(?:\s+[A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'/-]*){0,5})\s+(?:é|e está|está)\s+(?:uma|um)\s+(?:das|dos)"
+    ]
+    for p in body_patterns:
+        for m in re.finditer(p, body or ""):
+            add(m.group(1), candidates)
+
+    # Remove obvious media/publisher candidates and prefer a candidate that
+    # appears in the headline.
+    pub = (publisher or "").lower().strip()
+    filtered = [c for c in candidates if c.lower() not in GENERIC_COMPANIES and c.lower() != pub]
+    if not filtered:
+        return None
+
+    hl = headline.lower()
+    in_headline = [c for c in filtered if c.lower() in hl]
+    pool = in_headline or filtered
+    return sorted(pool, key=lambda x: (len(x.split()) > 8, len(x)))[0]
 
 def best_evidence(text, terms):
     sentences = re.split(r"(?<=[.!?])\s+", clean_text(text))
@@ -327,6 +387,9 @@ def run_hunt():
                 rss_desc = BeautifulSoup(item["description"], "html.parser").get_text(" ", strip=True)
 
                 page_title, page_text, final_url = fetch_page(url)
+                # Google News RSS links may remain on google.com; use RSS metadata as the canonical public evidence.
+                if "news.google.com" in (final_url or ""):
+                    final_url = url
                 article_title = page_title or strip_publisher(rss_title, publisher)
                 body = page_text or rss_desc
                 combined = clean_text(article_title + " " + rss_desc + " " + body)
@@ -494,7 +557,7 @@ def evidence(oid):
     return rows
 
 st.title("🔎 HUNTER TECHS")
-st.caption("Opportunity Intelligence Radar — CAÇA REAL")
+st.caption("Opportunity Intelligence Radar — CAÇA REAL • V6 — evidência antes da oportunidade")
 
 con = get_db()
 stats = [
