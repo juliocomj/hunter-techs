@@ -148,8 +148,13 @@ def get_db():
     CREATE TABLE IF NOT EXISTS hunts(
       id INTEGER PRIMARY KEY, started_at TEXT, finished_at TEXT, status TEXT,
       sources_found INTEGER DEFAULT 0, signals_found INTEGER DEFAULT 0,
-      companies INTEGER, new_opps INTEGER, updated_opps INTEGER, discarded INTEGER);
+      companies INTEGER, new_opps INTEGER, updated_opps INTEGER, discarded INTEGER,
+      unassigned_signals INTEGER DEFAULT 0);
     """)
+    hunt_cols = {r[1] for r in c.execute("PRAGMA table_info(hunts)").fetchall()}
+    if "unassigned_signals" not in hunt_cols:
+        c.execute("ALTER TABLE hunts ADD COLUMN unassigned_signals INTEGER DEFAULT 0")
+
     # V8: signal records are independent intelligence objects; company_id may be NULL.
     sig_cols = {r[1] for r in c.execute("PRAGMA table_info(signals)").fetchall()}
     if "confidence" not in sig_cols:
@@ -339,6 +344,81 @@ def classify(intent, need, pain, trigger, dm):
         "MEDIUM" if intent_level != "NONE" or need_level != "NONE" or pain_level != "NONE" else "LOW"
     )
     return intent_level, need_level, pain_level, timing_level, dm_level, score, confidence, cls
+
+def qualify_hunter(cur):
+    """Aggregate Milo signals per company and apply the TECHS qualification engine."""
+    rows = cur.execute("""
+        SELECT c.id, c.name, c.website, c.icp,
+               s.kind, s.evidence, s.confidence
+        FROM companies c
+        JOIN signals s ON s.company_id=c.id
+        ORDER BY c.id, s.created_at DESC
+    """).fetchall()
+    by_company = {}
+    for r in rows:
+        by_company.setdefault(r["id"], {
+            "id": r["id"], "name": r["name"], "website": r["website"],
+            "icp": r["icp"], "signals": []
+        })["signals"].append(r)
+
+    created = updated = 0
+    for cid, item in by_company.items():
+        sigs = item["signals"]
+        kinds = {s["kind"]: [] for s in sigs}
+        for s in sigs:
+            kinds.setdefault(s["kind"], []).append(s["evidence"])
+
+        intent_n = len(kinds.get("BUYING_INTENT", []))
+        need_n = len(kinds.get("NEED_SIGNAL", []))
+        pain_n = len(kinds.get("PAIN_RISK", []))
+        trigger_n = len(kinds.get("BUSINESS_TRIGGER", []))
+        dm = bool(kinds.get("DECISION_MAKER"))
+
+        intent, need, pain, timing, dm_level, score, confidence, cls = classify(
+            min(intent_n, 3), min(need_n, 2), min(pain_n, 2), min(trigger_n, 2), dm
+        )
+
+        # Do not create a commercial opportunity from a bare business trigger.
+        # A company must have at least a need, pain/risk, or buying-intent signal.
+        if need == "NONE" and pain == "NONE" and intent == "NONE":
+            cls = "IGNORE"
+
+        trigger_text = " | ".join(kinds.get("BUSINESS_TRIGGER", [])[:2]) or "Não identificado"
+        need_text = " | ".join(kinds.get("NEED_SIGNAL", [])[:3]) or "Não confirmado"
+        pain_text = " | ".join(kinds.get("PAIN_RISK", [])[:3]) or "Não confirmado"
+        intent_text = intent
+        dm_text = dm_level
+
+        reason_parts = []
+        for label, key in [("BUYING_INTENT", "BUYING_INTENT"), ("NEED_SIGNAL", "NEED_SIGNAL"),
+                           ("PAIN_RISK", "PAIN_RISK"), ("BUSINESS_TRIGGER", "BUSINESS_TRIGGER"),
+                           ("DECISION_MAKER", "DECISION_MAKER")]:
+            vals = kinds.get(key, [])
+            if vals:
+                reason_parts.append(label + ": " + " | ".join(vals[:2]))
+        reason = "\n".join(reason_parts) or "Sem evidência suficiente."
+
+        if cls == "HOT":
+            action = "Abordar decisor rapidamente e validar processo de compra."
+        elif cls == "WARM":
+            action = "Abordagem consultiva e validação da necessidade."
+        elif cls == "WATCH":
+            action = "Monitorar novos sinais antes de abordagem comercial."
+        else:
+            action = "Não abordar; aguardar evidência adicional."
+
+        exists = cur.execute("SELECT id FROM opportunities WHERE company_id=?", (cid,)).fetchone()
+        if exists:
+            cur.execute("""UPDATE opportunities SET trigger_text=?,need=?,pain=?,intent=?,dm=?,timing=?,
+                           score=?,confidence=?,classification=?,next_action=?,reason=?,updated_at=? WHERE company_id=?""",
+                        (trigger_text,need_text,pain_text,intent_text,dm_text,timing,score,confidence,cls,action,reason,now(),cid))
+            updated += 1
+        else:
+            cur.execute("""INSERT INTO opportunities(company_id,trigger_text,need,pain,intent,dm,timing,score,confidence,classification,next_action,reason,created_at,updated_at)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (cid,trigger_text,need_text,pain_text,intent_text,dm_text,timing,score,confidence,cls,action,reason,now(),now()))
+            created += 1
+    return created, updated
 
 def run_hunt():
     """V8 pipeline: MILO collects/structures signals first; HUNTER qualifies later."""
