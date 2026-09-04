@@ -9,7 +9,7 @@ st.set_page_config(page_title="HUNTER TECHS", page_icon="🔎", layout="wide")
 DB = "hunter.db"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/126 Safari/537.36 TECHS-Hunter/5.0"
+                  "(KHTML, like Gecko) Chrome/126 Safari/537.36 TECHS-Hunter/8.0"
 }
 
 # The Hunter searches for observable commercial/operational signals.
@@ -130,13 +130,14 @@ def get_db():
       icp TEXT DEFAULT 'UNKNOWN', created_at TEXT, updated_at TEXT);
 
     CREATE TABLE IF NOT EXISTS sources(
-      id INTEGER PRIMARY KEY, company_id INTEGER, title TEXT, url TEXT UNIQUE,
-      source_type TEXT DEFAULT 'NOTICIA', publisher TEXT, collected_at TEXT, content TEXT);
+      id INTEGER PRIMARY KEY, company_id INTEGER NULL, title TEXT, url TEXT UNIQUE,
+      source_type TEXT DEFAULT 'NOTICIA', publisher TEXT, collected_at TEXT, content TEXT,
+      published_at TEXT, query TEXT);
 
     CREATE TABLE IF NOT EXISTS signals(
-      id INTEGER PRIMARY KEY, company_id INTEGER, source_id INTEGER, kind TEXT,
-      evidence TEXT, evidence_type TEXT, created_at TEXT,
-      UNIQUE(company_id,source_id,kind,evidence));
+      id INTEGER PRIMARY KEY, company_id INTEGER NULL, source_id INTEGER NULL, kind TEXT,
+      evidence TEXT, evidence_type TEXT, confidence TEXT DEFAULT 'MEDIUM', created_at TEXT,
+      UNIQUE(source_id,kind,evidence));
 
     CREATE TABLE IF NOT EXISTS opportunities(
       id INTEGER PRIMARY KEY, company_id INTEGER UNIQUE, trigger_text TEXT,
@@ -149,6 +150,16 @@ def get_db():
       sources_found INTEGER DEFAULT 0, signals_found INTEGER DEFAULT 0,
       companies INTEGER, new_opps INTEGER, updated_opps INTEGER, discarded INTEGER);
     """)
+    # V8: signal records are independent intelligence objects; company_id may be NULL.
+    sig_cols = {r[1] for r in c.execute("PRAGMA table_info(signals)").fetchall()}
+    if "confidence" not in sig_cols:
+        c.execute("ALTER TABLE signals ADD COLUMN confidence TEXT DEFAULT 'MEDIUM'")
+    src_cols = {r[1] for r in c.execute("PRAGMA table_info(sources)").fetchall()}
+    if "published_at" not in src_cols:
+        c.execute("ALTER TABLE sources ADD COLUMN published_at TEXT")
+    if "query" not in src_cols:
+        c.execute("ALTER TABLE sources ADD COLUMN query TEXT")
+
     # V6 migration/cleanup: never allow a source/publisher to survive as a company.
     placeholders = ",".join("?" * len(GENERIC_COMPANIES))
     c.execute(
@@ -330,53 +341,88 @@ def classify(intent, need, pain, trigger, dm):
     return intent_level, need_level, pain_level, timing_level, dm_level, score, confidence, cls
 
 def run_hunt():
-    con=get_db(); cur=con.cursor(); cur.execute("INSERT INTO hunts(started_at,status) VALUES(?,?)",(now(),"RUNNING")); hunt_id=cur.lastrowid; con.commit()
-    raw=[]; seen=set(); companies=set(); sources_found=signals_found=discarded=new_opps=updated=0
+    """V8 pipeline: MILO collects/structures signals first; HUNTER qualifies later."""
+    con=get_db(); cur=con.cursor()
+    cur.execute("INSERT INTO hunts(started_at,status) VALUES(?,?)",(now(),"RUNNING"))
+    hunt_id=cur.lastrowid; con.commit()
+    raw=[]; seen=set(); sources_found=signals_found=discarded=0; unassigned=0
     try:
-        # MILO: breadth first. Qualification happens only after collection.
+        # ---------------- MILO: broad collection ----------------
         for q in QUERIES:
             for item in rss_search(q):
-                if item["url"] not in seen: seen.add(item["url"]); raw.append(item)
-        for item in pncp_search(max_pages=3):
-            k=item["url"]+"|"+item["title"][:100]
-            if k not in seen: seen.add(k); raw.append(item)
+                key=item["url"]
+                if key not in seen:
+                    seen.add(key); raw.append(item)
+        for item in pncp_search(max_pages=5):
+            key=item["url"]+"|"+item["title"][:120]
+            if key not in seen:
+                seen.add(key); raw.append(item)
         sources_found=len(raw)
+
+        # First pass is intentionally permissive: a source with any relevant
+        # keyword is a candidate for Milo. We do not discard it merely because
+        # the company is not yet resolved.
+        candidates=[]
         for item in raw:
+            meta=clean_text(item.get("title","")+" "+item.get("description",""))
+            hits=(term_hits(meta,INTENT_TERMS)+term_hits(meta,NEED_TERMS)+
+                  term_hits(meta,TRIGGER_TERMS)+term_hits(meta,PAIN_TERMS)+term_hits(meta,DM_TERMS))
+            if hits:
+                score=len(set(hits)) + (3 if item.get("source_type")=="PNCP" else 0)
+                candidates.append((score,item))
+        candidates.sort(key=lambda x:-x[0])
+
+        # Keep Cloud responsive: enrich the strongest 220 sources. The full
+        # source count remains visible, while signals from selected sources are
+        # persisted independently.
+        for _,item in candidates[:220]:
             desc=BeautifulSoup(item.get("description",""),"html.parser").get_text(" ",strip=True)
             page_title,page_text,final_url=fetch_page(item.get("url",""))
-            title=page_title or strip_publisher(item.get("title",""),item.get("publisher","")); body=page_text or desc
+            title=page_title or strip_publisher(item.get("title",""),item.get("publisher",""))
+            body=page_text or desc
             combined=clean_text(title+" "+desc+" "+body)
-            for terms in (INTENT_TERMS,NEED_TERMS,TRIGGER_TERMS,PAIN_TERMS):
-                if term_hits(combined,terms): signals_found+=1
+
             company=extract_company(title,body,item.get("publisher",""),item.get("company_candidate"))
-            if not company:
-                discarded+=1; continue
-            companies.add(company)
-            row=cur.execute("SELECT id FROM companies WHERE lower(name)=lower(?)",(company,)).fetchone()
-            if row: cid=row["id"]; cur.execute("UPDATE companies SET website=?,updated_at=? WHERE id=?",(final_url,now(),cid))
-            else: cur.execute("INSERT INTO companies(name,website,created_at,updated_at) VALUES(?,?,?,?)",(company,final_url,now(),now())); cid=cur.lastrowid
-            cur.execute("INSERT OR IGNORE INTO sources(company_id,title,url,source_type,publisher,collected_at,content) VALUES(?,?,?,?,?,?,?)",(cid,title,final_url,item.get("source_type","NOTICIA"),item.get("publisher",""),now(),body[:40000]))
+            cid=None
+            if company:
+                row=cur.execute("SELECT id FROM companies WHERE lower(name)=lower(?)",(company,)).fetchone()
+                if row:
+                    cid=row["id"]
+                    cur.execute("UPDATE companies SET website=?,updated_at=? WHERE id=?",(final_url,now(),cid))
+                else:
+                    cur.execute("INSERT INTO companies(name,website,created_at,updated_at) VALUES(?,?,?,?)",(company,final_url,now(),now()))
+                    cid=cur.lastrowid
+
+            cur.execute("""INSERT INTO sources(company_id,title,url,source_type,publisher,collected_at,content,published_at,query)
+                           VALUES(?,?,?,?,?,?,?,?,?)
+                           ON CONFLICT(url) DO UPDATE SET company_id=COALESCE(excluded.company_id,sources.company_id),
+                           title=excluded.title,publisher=excluded.publisher,collected_at=excluded.collected_at,
+                           content=excluded.content,published_at=excluded.published_at,query=excluded.query""",
+                        (cid,title,final_url,item.get("source_type","NOTICIA"),item.get("publisher",""),now(),body[:50000],item.get("published",""),item.get("query","")))
             sid=cur.execute("SELECT id FROM sources WHERE url=?",(final_url,)).fetchone()["id"]
-            for kind,terms in (("BUYING_INTENT",INTENT_TERMS),("NEED_SIGNAL",NEED_TERMS),("BUSINESS_TRIGGER",TRIGGER_TERMS),("PAIN_RISK",PAIN_TERMS)):
-                ev=best_evidence(combined,terms)
-                if ev: cur.execute("INSERT OR IGNORE INTO signals(company_id,source_id,kind,evidence,evidence_type,created_at) VALUES(?,?,?,?,?,?)",(cid,sid,kind,ev[0],"FACT",now()))
-            ih=term_hits(combined,INTENT_TERMS); nh=term_hits(combined,NEED_TERMS); th=term_hits(combined,TRIGGER_TERMS); ph=term_hits(combined,PAIN_TERMS); dh=term_hits(combined,DM_TERMS)
-            # Trigger alone remains a signal; it cannot create an opportunity.
-            if not (ih or nh or ph): discarded+=1; con.commit(); continue
-            intent_level,need_level,pain_level,timing_level,dm_level,score,confidence,cls=classify(len(ih),len(nh),len(ph),len(th),bool(dh))
-            if item.get("source_type")=="PNCP" and cls in ("HOT","WARM"): cls="WATCH"; confidence="HIGH"
-            reason=(f"ICP FIT: UNKNOWN (7/15). Buying Intent: {intent_level}. Need Signal: {need_level}. Pain/Risk: {pain_level}. Timing: {timing_level}. Decision Maker: {dm_level}. Fonte: {item.get('publisher') or item.get('source_type','NOTICIA')} ({item.get('source_type','NOTICIA')}).")
-            next_action={"HOT":"Abordar rapidamente o decisor e validar processo de compra, escopo e prazo.","WARM":"Abordagem consultiva baseada na evidência; confirmar necessidade, intenção e ICP.","WATCH":"Investigar/enriquecer o sinal antes da abordagem; buscar segunda evidência independente.","IGNORE":"Não abordar; evidência insuficiente."}[cls]
-            old=cur.execute("SELECT id FROM opportunities WHERE company_id=?",(cid,)).fetchone()
-            cur.execute("""INSERT INTO opportunities(company_id,trigger_text,need,pain,intent,dm,timing,score,confidence,classification,next_action,reason,created_at,updated_at)
-              VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(company_id) DO UPDATE SET trigger_text=excluded.trigger_text,need=excluded.need,pain=excluded.pain,intent=excluded.intent,dm=excluded.dm,timing=excluded.timing,score=excluded.score,confidence=excluded.confidence,classification=excluded.classification,next_action=excluded.next_action,reason=excluded.reason,updated_at=excluded.updated_at""",
-              (cid,th[0] if th else "UNKNOWN",need_level,pain_level,intent_level,dm_level,timing_level,score,confidence,cls,next_action,reason,now(),now()))
-            if cls=="IGNORE": discarded+=1
-            elif old: updated+=1
-            else: new_opps+=1
+
+            for kind,terms in (("BUYING_INTENT",INTENT_TERMS),("NEED_SIGNAL",NEED_TERMS),
+                               ("BUSINESS_TRIGGER",TRIGGER_TERMS),("PAIN_RISK",PAIN_TERMS),
+                               ("DECISION_MAKER",DM_TERMS)):
+                for ev in best_evidence(combined,terms):
+                    conf="HIGH" if item.get("source_type")=="PNCP" else "MEDIUM"
+                    exists=cur.execute("SELECT id FROM signals WHERE source_id=? AND kind=? AND evidence=?",(sid,kind,ev)).fetchone()
+                    if not exists:
+                        cur.execute("INSERT INTO signals(company_id,source_id,kind,evidence,evidence_type,confidence,created_at) VALUES(?,?,?,?,?,?,?)",
+                                    (cid,sid,kind,ev,"FACT",conf,now()))
+                        signals_found+=1
+                        if cid is None: unassigned+=1
             con.commit()
-        cur.execute("UPDATE hunts SET finished_at=?,status=?,sources_found=?,signals_found=?,companies=?,new_opps=?,updated_opps=?,discarded=? WHERE id=?",(now(),"COMPLETED",sources_found,signals_found,len(companies),new_opps,updated,discarded,hunt_id)); con.commit()
-        return hunt_id,sources_found,signals_found,len(companies),new_opps,updated,discarded
+
+        # ---------------- HUNTER: aggregate and qualify ----------------
+        new_opps,updated=qualify_hunter(cur)
+        companies_count=cur.execute("SELECT COUNT(*) FROM companies").fetchone()[0]
+        # A discard is now a qualification outcome, not a signal deletion.
+        discarded=cur.execute("SELECT COUNT(*) FROM signals WHERE company_id IS NULL").fetchone()[0]
+        cur.execute("UPDATE hunts SET finished_at=?,status=?,sources_found=?,signals_found=?,companies=?,new_opps=?,updated_opps=?,discarded=?,unassigned_signals=? WHERE id=?",
+                    (now(),"COMPLETED",sources_found,signals_found,companies_count,new_opps,updated,discarded,unassigned,hunt_id))
+        con.commit()
+        return hunt_id,sources_found,signals_found,companies_count,new_opps,updated,discarded,unassigned
     except Exception:
         cur.execute("UPDATE hunts SET finished_at=?,status=? WHERE id=?",(now(),"FAILED",hunt_id)); con.commit(); raise
     finally: con.close()
@@ -391,10 +437,18 @@ def opportunities():
     con.close()
     return rows
 
+def all_signals():
+    con=get_db()
+    rows=con.execute("""SELECT s.*,c.name AS company,src.title,src.url,src.source_type,src.publisher,src.collected_at
+                       FROM signals s LEFT JOIN companies c ON c.id=s.company_id
+                       LEFT JOIN sources src ON src.id=s.source_id
+                       ORDER BY s.created_at DESC""").fetchall()
+    con.close(); return rows
+
 def evidence(oid):
     con = get_db()
     rows = con.execute(
-        """SELECT s.kind,s.evidence,src.title,src.url,src.collected_at
+        """SELECT s.kind,s.evidence,s.confidence,src.title,src.url,src.collected_at,src.source_type
            FROM signals s
            JOIN sources src ON src.id=s.source_id
            JOIN opportunities o ON o.company_id=s.company_id
@@ -404,7 +458,7 @@ def evidence(oid):
     return rows
 
 st.title("🔎 HUNTER TECHS")
-st.caption("Opportunity Intelligence Radar — CAÇA REAL • V7 — MILO lê sinais | HUNTER peneira oportunidades")
+st.caption("Opportunity Intelligence Radar — CAÇA REAL • V8 — MILO lê sinais | HUNTER peneira oportunidades")
 
 con = get_db()
 stats = [
@@ -429,45 +483,38 @@ if st.button("🔎 IR PARA CAÇA", type="primary", use_container_width=True):
             result = run_hunt()
             st.success(
                 f"Caça #{result[0]} concluída — "
-                f"{result[1]} fontes | {result[2]} sinais | {result[3]} empresas | "
-                f"{result[4]} novas | {result[5]} atualizadas | {result[6]} descartadas."
+                f"{result[1]} fontes encontradas | {result[2]} sinais estruturados | {result[3]} empresas | "
+                f"{result[4]} novas | {result[5]} atualizadas | {result[6]} sinais sem empresa | {result[7]} registros sem empresa."
             )
         except Exception as ex:
             st.error(f"Erro na caça: {ex}")
 
 st.divider()
-f = st.selectbox("Classificação", ["TODAS","HOT","WARM","WATCH","IGNORE"])
-
-for o in opportunities():
-    if f != "TODAS" and o["classification"] != f:
-        continue
-
-    icon = {"HOT":"🔥","WARM":"🟠","WATCH":"👁️","IGNORE":"⛔"}[o["classification"]]
-
-    with st.container(border=True):
-        x,y,z = st.columns([5,1,1])
-        x.subheader(f"{icon} {o['name']}")
-        x.caption(o["website"] or "")
-        y.metric("Score", o["score"])
-        z.metric("Confidence", o["confidence"])
-
-        st.write(
-            f"**ICP:** {o['icp']} | **Intent:** {o['intent']} | "
-            f"**Need:** {o['need']} | **Pain/Risk:** {o['pain']} | "
-            f"**Timing:** {o['timing']}"
-        )
-        st.write(
-            f"**Trigger:** {o['trigger_text']} | **Decision Maker:** {o['dm']}"
-        )
-        st.write(f"**Próxima ação:** {o['next_action']}")
-
-        with st.expander("Evidências rastreáveis"):
-            st.write(o["reason"])
-            for v in evidence(o["id"]):
-                st.markdown(f"- **{v['kind']} / FACT:** {v['evidence']}")
-                st.caption(
-                    f"{v['title']} — {v['url']} | coletada {v['collected_at']}"
-                )
+view=st.radio("Visão",["Oportunidades","Sinais do Milo"],horizontal=True)
+if view=="Oportunidades":
+    f=st.selectbox("Classificação",["TODAS","HOT","WARM","WATCH","IGNORE"])
+    for o in opportunities():
+        if f!="TODAS" and o["classification"]!=f: continue
+        icon={"HOT":"🔥","WARM":"🟠","WATCH":"👁️","IGNORE":"⛔"}[o["classification"]]
+        with st.container(border=True):
+            x,y,z=st.columns([5,1,1]); x.subheader(f"{icon} {o['name']}"); x.caption(o["website"] or "")
+            y.metric("Score",o["score"]); z.metric("Confidence",o["confidence"])
+            st.write(f"**ICP:** {o['icp']} | **Intent:** {o['intent']} | **Need:** {o['need']} | **Pain/Risk:** {o['pain']} | **Timing:** {o['timing']} | **DM:** {o['dm']}")
+            st.write(f"**Próxima ação:** {o['next_action']}")
+            with st.expander("Evidências rastreáveis"):
+                st.write(o["reason"])
+                for v in evidence(o["id"]):
+                    st.markdown(f"- **{v['kind']} / {v['confidence']}:** {v['evidence']}")
+                    st.caption(f"{v['title']} — {v['url']} | {v['source_type']} | {v['collected_at']}")
+else:
+    sigs=all_signals()
+    st.caption(f"Milo estruturou {len(sigs)} sinais. Sinais sem empresa continuam armazenados e não viram oportunidades automaticamente.")
+    for s in sigs[:250]:
+        with st.container(border=True):
+            company=s["company"] or "Empresa ainda não resolvida"
+            x,y=st.columns([6,1]); x.markdown(f"**{company}** — `{s['kind']}`"); y.caption(s["source_type"] or "")
+            st.write(s["evidence"])
+            st.caption(f"{s['title']} | {s['url']} | {s['collected_at']}")
 
 st.divider()
 st.subheader("Exportação")
@@ -495,9 +542,18 @@ st.download_button(
     "hunter_techs.csv", "text/csv"
 )
 
+signal_rows=all_signals()
+sdata=[]
+for s in signal_rows:
+    sdata.append({"Company":s["company"] or "","Signal Type":s["kind"],"Evidence":s["evidence"],"Confidence":s["confidence"],
+                  "Source Type":s["source_type"] or "","Source":s["title"] or "","Source URL":s["url"] or "","Collected Date":s["collected_at"] or ""})
+sdf=pd.DataFrame(sdata)
+st.download_button("⬇️ Exportar sinais do Milo CSV",sdf.to_csv(index=False).encode("utf-8-sig"),"hunter_techs_milo_signals.csv","text/csv")
+
 buf = io.BytesIO()
 with pd.ExcelWriter(buf, engine="openpyxl") as writer:
     df.to_excel(writer, index=False, sheet_name="Opportunities")
+    sdf.to_excel(writer, index=False, sheet_name="Milo_Signals")
 
 st.download_button(
     "⬇️ Exportar XLSX", buf.getvalue(), "hunter_techs.xlsx",
