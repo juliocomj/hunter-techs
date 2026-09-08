@@ -7,6 +7,19 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
+# PHASE 1: Import new modules
+try:
+    from entity_resolver import EntityResolver, validate_company_name, clean_company, source_domain
+    from signal_validator import (
+        filter_signals, validate_buying_intent, classify_signal_type,
+        extract_timeline, extract_specificity_signals, calculate_specificity_bonus,
+        is_hiring_signal, has_negative_keywords
+    )
+    PHASE_1_ENABLED = True
+except ImportError as e:
+    print(f"⚠️  PHASE 1 modules not found: {e}")
+    PHASE_1_ENABLED = False
+
 st.set_page_config(page_title="HUNTER TECHS", page_icon="🔎", layout="wide")
 
 DB = "hunter.db"
@@ -33,10 +46,6 @@ SEARCH_QUERIES = [
     '"nova filial" empresa', '"aquisição" empresa tecnologia', '"fusão" empresa tecnologia',
     'ransomware empresa', '"incidente de segurança" empresa', '"ataque cibernético" empresa',
     '"vulnerabilidade" empresa segurança', '"vazamento de dados" empresa',
-    '"vaga" "segurança da informação"', '"vaga" "infraestrutura de TI"',
-    '"vaga" SOC empresa', '"vaga" "cloud engineer" empresa',
-    '"vaga" "analista de infraestrutura" empresa', '"contratação" "firewall"',
-    '"contratação" "EDR"', '"contratação" "SASE"', '"contratação" "SOC"',
     '"monitoramento 24x7" empresa', '"continuidade de negócios" empresa tecnologia',
 ]
 
@@ -105,13 +114,6 @@ def term_hits(text, terms):
     return [t for t in terms if t in low]
 
 
-def source_domain(url):
-    try:
-        return (urlparse(url).netloc or "").lower().replace("www.", "")
-    except Exception:
-        return ""
-
-
 def valid_company(name):
     if not name:
         return False
@@ -129,10 +131,8 @@ def valid_company(name):
     return True
 
 
-def clean_company(c):
+def clean_company_old(c):
     c = norm(c).strip(" -–—:,.()[]\"'")
-    # Prevent a proper-noun regex from swallowing a second sentence/entity.
-    # Example: "Empresa XPTO A Empresa XPTO" -> "Empresa XPTO".
     m = re.search(r"\s+[AaOo]\s+(?:Empresa|Grupo|Companhia|Holding)\b", c)
     if m:
         c = c[:m.start()]
@@ -142,9 +142,27 @@ def clean_company(c):
 
 
 def extract_company(title, body, publisher, explicit_candidate=None, url=""):
+    """PHASE 1: Enhanced entity resolution with spaCy fallback"""
+    
+    # Use PHASE 1 resolver if available
+    if PHASE_1_ENABLED:
+        try:
+            # Get existing companies for dedup
+            c = sqlite3.connect(DB)
+            existing = c.execute("SELECT id, name, website FROM companies LIMIT 500").fetchall()
+            existing_list = [{'name': e[1], 'website': e[2]} for e in existing]
+            c.close()
+            
+            resolver = EntityResolver(existing_list)
+            company = resolver.resolve_company(title, body, publisher, url, explicit_candidate)
+            return company
+        except Exception as e:
+            print(f"⚠️  PHASE 1 resolver error: {e}, falling back to legacy")
+    
+    # Fallback to original logic
     candidates = []
     def add(c, weight=0):
-        c = clean_company(c)
+        c = clean_company_old(c)
         if valid_company(c) and c.lower() != (publisher or "").lower() and c.lower() not in {x[0].lower() for x in candidates}:
             candidates.append((c, weight))
 
@@ -155,36 +173,28 @@ def extract_company(title, body, publisher, explicit_candidate=None, url=""):
     b = norm(body)
     h = t + " " + b[:8000]
 
-    # Strong headline subjects: "Empresa X anuncia..." / "Empresa X: ..."
-    verb = r"(?:anuncia|anunciou|contrata|contratou|busca|buscou|expande|expandiu|abre|abriu|projeta|prevê|preve|investe|investiu|inicia|iniciou|adota|adotou|lança|lancou|lançou|moderniza|modernizou|reestrutura|reestruturou)"
+    verb = r"(?:anuncia|anunciou|contrata|contratou|busca|buscou|expande|expandiu|abre|abriu|projeta|prevê|preve|investe|investiu|inicia|iniciou|adota|adotou|lança|lancou|lançou|moderniza|modernizou)"
     for m in re.finditer(rf"^(.{{3,100}}?)\s+{verb}\b", t, flags=re.I):
         add(m.group(1), 90)
     for m in re.finditer(r"^(.{3,90}?)\s*[:–—-]\s+", t):
         add(m.group(1), 70)
 
-    # Explicit organization phrases in title/body. Prefer a proper-noun block
-    # immediately before a strong business verb; this is much safer than taking
-    # arbitrary text after "empresa".
-    verb_words = r"(?:anuncia|anunciou|contrata|contratou|busca|buscou|expande|expandiu|abre|abriu|projeta|prevê|preve|investe|investiu|inicia|iniciou|adota|adotou|lança|lancou|lançou|moderniza|modernizou|reestrutura|reestruturou)"
+    verb_words = r"(?:anuncia|anunciou|contrata|contratou|busca|buscou|expande|expandiu|abre|abriu|projeta|prevê|preve|investe|investiu|inicia|iniciou|adota|adotou|lança|lancou|lançou|moderniza|modernizou)"
     for m in re.finditer(
         rf"\b([A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'/-]*(?:\s+[A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÀ-ÖØ-öø-ÿ0-9&.'/-]*){{0,6}})\s+{verb_words}\b",
         h
     ):
         add(m.group(1), 65)
 
-    # Proper-noun runs in the first part of the article. Useful when the text says
-    # "A XPTO anunciou..." without using the word empresa.
     first = (t + " " + b[:2500])
-    for m in re.finditer(r"\b([A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÁÀÂÃÉÊÍÓÔÕÚÇáàâãéêíóôõúç0-9&.'/-]*(?:\s+[A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÁÀÂÃÉÊÍÓÔÕÚÇáàâãéêíóôõúç0-9&.'/-]*){0,5})", first):
+    for m in re.finditer(r"\b([A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÁÀÂÃÉÊÍÓÔÕÚÇáàâãéêíóôõúç0-9&.'/-]*(?:\s+[A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][A-Za-zÁÀÂÃÉÊÍÓÔÕÚÇáàâãéêíóôõúç0-9&.'/-]*){{0,6}})\b", first):
         c = m.group(1)
         low = c.lower()
-        if low not in {"Novo", "Nova", "Empresa", "Grupo", "Brasil", "São Paulo", "Rio de Janeiro"}:
+        if low not in {"novo", "nova", "empresa", "grupo", "brasil", "são paulo", "rio de janeiro"}:
             weight = 35 + (20 if LEGAL_SUFFIX.search(c) else 0)
             add(c, weight)
 
-    # If the article itself is hosted on a company-looking domain, use the domain
-    # only as a last resort. Never turn a known media domain into a company.
-    dom = source_domain(url)
+    dom = source_domain(url) if source_domain else urlparse(url).netloc.lower().replace("www.", "")
     if dom and dom not in MEDIA_DOMAINS and not any(x in dom for x in ["gov.br", "jus.br", "leg.br"]):
         root = dom.split(".")[0]
         if len(root) >= 4 and root not in MEDIA_NAMES and root not in {"www", "blog", "portal", "site"}:
@@ -219,9 +229,22 @@ def evidence_snippets(text, terms, max_items=4):
 
 
 def classify_company(signals):
+    """PHASE 1: Enhanced classification with signal validation"""
+    
+    # NEW: Filter out hiring signals and negative keywords
+    if PHASE_1_ENABLED:
+        try:
+            filtered_signals = filter_signals(signals)
+            if not filtered_signals:
+                return "NONE", "NONE", "NONE", "NONE", "NONE", 0, "LOW", "IGNORE"
+            signals = filtered_signals
+        except Exception as e:
+            print(f"⚠️  Signal filtering error: {e}")
+    
     by = {}
     for s in signals:
         by.setdefault(s["kind"], []).append(s)
+    
     intent_strong = len(by.get("BUYING_INTENT", []))
     need_n = len(by.get("NEED_SIGNAL", []))
     pain_n = len(by.get("PAIN_RISK", []))
@@ -237,6 +260,14 @@ def classify_company(signals):
     timing = "HIGH" if trigger_n >= 2 else ("MEDIUM" if trigger_n == 1 else "NONE")
     dm = "LIKELY" if dm_n else "NONE"
 
+    # NEW: Specificity bonus from PHASE 1
+    specificity_bonus = 0
+    if PHASE_1_ENABLED:
+        try:
+            specificity_bonus = calculate_specificity_bonus(signals)
+        except Exception:
+            pass
+
     # TECHS Engine V1.1 — conservative, with ICP unknown until evidence exists.
     score = 7
     score += {"NONE":0, "MEDIUM":6, "HIGH":15, "VERY HIGH":25}[intent]
@@ -244,8 +275,10 @@ def classify_company(signals):
     score += {"NONE":0, "MEDIUM":10, "HIGH":20}[pain]
     score += {"NONE":0, "MEDIUM":5, "HIGH":10}[timing]
     score += 7 if dm == "LIKELY" else 0
+    score += specificity_bonus  # NEW: Add specificity bonus
     score = min(score, {"NONE":30, "MEDIUM":75, "HIGH":90, "VERY HIGH":100}[intent])
 
+    # NEW: Require NEED or PAIN for WARM+ classification
     if intent == "VERY HIGH" and need != "NONE" and score >= 75:
         cls = "HOT"
     elif intent in ("HIGH", "VERY HIGH") and need != "NONE" and score >= 55:
@@ -254,6 +287,7 @@ def classify_company(signals):
         cls = "WATCH"
     else:
         cls = "IGNORE"
+    
     confidence = "HIGH" if intent in ("HIGH", "VERY HIGH") and need != "NONE" else ("MEDIUM" if need != "NONE" or pain != "NONE" or intent != "NONE" else "LOW")
     return intent, need, pain, timing, dm, score, confidence, cls
 
@@ -346,7 +380,7 @@ def pncp_search(pages=6, days_forward=30):
                 if not link and ctrl: link = "https://pncp.gov.br/app/editais/" + ctrl
                 if not link: link = "https://pncp.gov.br/"
                 out.append({
-                    "title": norm((org + " — " + obj)[:500]), "url": link,
+                    "title": norm((org + " �� " + obj)[:500]), "url": link,
                     "description": obj, "published": norm(row.get("dataPublicacaoPncp") or ""),
                     "publisher": "PNCP", "source_type": "PNCP", "company_candidate": org,
                     "query": "PNCP propostas abertas"
@@ -371,17 +405,18 @@ def fetch_page(url):
 
 def find_or_create_company(cur, name, website):
     if not valid_company(name): return None
-    name = clean_company(name)
+    name = clean_company_old(name)
     row = cur.execute("SELECT id FROM companies WHERE lower(name)=lower(?)", (name,)).fetchone()
     if row:
         cid = row["id"]
         if website: cur.execute("UPDATE companies SET website=?,updated_at=? WHERE id=?", (website, now(), cid))
         return cid
     # Domain-level merge: same company site, different article-derived spelling.
-    dom = source_domain(website)
+    dom = source_domain(website) if source_domain else (urlparse(website).netloc.lower().replace("www.", "") if website else "")
     if dom and dom not in MEDIA_DOMAINS:
         for r in cur.execute("SELECT id,website FROM companies WHERE website IS NOT NULL").fetchall():
-            if source_domain(r["website"]) == dom and dom:
+            company_dom = source_domain(r["website"]) if source_domain else (urlparse(r["website"]).netloc.lower().replace("www.", "") if r["website"] else "")
+            if company_dom == dom and dom:
                 cur.execute("UPDATE companies SET updated_at=? WHERE id=?", (now(), r["id"]))
                 return r["id"]
     cur.execute("INSERT INTO companies(name,website,icp,created_at,updated_at) VALUES(?,?,?,?,?)", (name, website or "", "UNKNOWN", now(), now()))
@@ -418,10 +453,10 @@ def qualify_hunter(cur):
         exists = cur.execute("SELECT id FROM opportunities WHERE company_id=?", (cid,)).fetchone()
         vals=(trigger_text,need_text,pain_text,intent,dm,timing,score,conf,cls,action,reason,now())
         if exists:
-            cur.execute("""UPDATE opportunities SET trigger_text=?,need=?,pain=?,intent=?,dm=?,timing=?,score=?,confidence=?,classification=?,next_action=?,reason=?,updated_at=? WHERE company_id=?""", vals+(cid,))
+            cur.execute("""UPDATE opportunities SET trigger_text=?,need=?,pain=?,intent=?,dm=?,timing=?,score=?,confidence=?,classification=?,next_action=?,reason=?,updated_at=? WHERE company_id=?""", vals + (cid,))
             updated += 1
         else:
-            cur.execute("""INSERT INTO opportunities(company_id,trigger_text,need,pain,intent,dm,timing,score,confidence,classification,next_action,reason,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (cid,)+vals+(now(),))
+            cur.execute("""INSERT INTO opportunities(company_id,trigger_text,need,pain,intent,dm,timing,score,confidence,classification,next_action,reason,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (cid,) + vals)
             created += 1
     return created,updated
 
@@ -483,6 +518,14 @@ def run_hunt():
             ]
             for kind,terms in signal_defs:
                 for ev in evidence_snippets(combined,terms,4):
+                    # NEW: Check hiring signals and reject
+                    if PHASE_1_ENABLED and kind == "BUYING_INTENT" and is_hiring_signal(ev):
+                        continue  # Skip hiring signals
+                    
+                    # NEW: Check negative keywords
+                    if PHASE_1_ENABLED and has_negative_keywords(ev):
+                        continue  # Skip negative signals
+                    
                     # Milo confidence is evidence confidence, not opportunity confidence.
                     conf="HIGH" if item.get("source_type")=="PNCP" and kind=="BUYING_INTENT" else "MEDIUM"
                     exists=cur.execute("SELECT id FROM signals WHERE source_id=? AND kind=? AND evidence=?",(sid,kind,ev)).fetchone()
@@ -501,28 +544,29 @@ def run_hunt():
                     (now(),"COMPLETED",sources_found,signals_found,companies,new_opps,updated,unassigned_total,unassigned,hid))
         con.commit()
         return hid,sources_found,signals_found,companies,new_opps,updated,unassigned_total,unassigned
-    except Exception:
+    except Exception as e:
         cur.execute("UPDATE hunts SET finished_at=?,status=? WHERE id=?",(now(),"FAILED",hid)); con.commit(); raise
     finally:
         con.close()
 
 
 def opportunities():
-    c=get_db(); rows=c.execute("""SELECT o.*,c.name,c.website,c.icp FROM opportunities o JOIN companies c ON c.id=o.company_id ORDER BY o.score DESC,o.updated_at DESC""").fetchall(); c.close(); return rows
+    c=get_db(); rows=c.execute("""SELECT o.*,c.name,c.website,c.icp FROM opportunities o JOIN companies c ON c.id=o.company_id ORDER BY o.score DESC,o.updated_at DESC""").fetchall(); c.close(); return [dict(r) for r in rows]
 
 
 def all_signals():
-    c=get_db(); rows=c.execute("""SELECT s.*,c.name AS company,src.title,src.url,src.source_type,src.publisher,src.collected_at FROM signals s LEFT JOIN companies c ON c.id=s.company_id LEFT JOIN sources src ON src.id=s.source_id ORDER BY s.created_at DESC""").fetchall(); c.close(); return rows
+    c=get_db(); rows=c.execute("""SELECT s.*,c.name AS company,src.title,src.url,src.source_type,src.publisher,src.collected_at FROM signals s LEFT JOIN companies c ON c.id=s.company_id LEFT JOIN sources src ON src.id=s.source_id ORDER BY s.created_at DESC""").fetchall(); c.close(); return [dict(r) for r in rows]
 
 
 def evidence(oid):
-    c=get_db(); rows=c.execute("""SELECT s.kind,s.evidence,s.confidence,src.title,src.url,src.collected_at,src.source_type FROM signals s JOIN sources src ON src.id=s.source_id JOIN opportunities o ON o.company_id=s.company_id WHERE o.id=? ORDER BY src.collected_at DESC""",(oid,)).fetchall(); c.close(); return rows
+    c=get_db(); rows=c.execute("""SELECT s.kind,s.evidence,s.confidence,src.title,src.url,src.collected_at,src.source_type FROM signals s JOIN sources src ON src.id=s.source_id JOIN opportunities o ON o.id=? WHERE s.company_id=o.company_id ORDER BY s.created_at DESC""", (oid,)).fetchall(); c.close(); return [dict(r) for r in rows]
 
 # ============================================================
 # UI
 # ============================================================
 st.title("🔎 HUNTER TECHS")
-st.caption("Opportunity Intelligence Radar — CAÇA REAL • V9 — MILO lê o mercado | HUNTER peneira oportunidades")
+status_msg = "PHASE 1 ATIVO ✅" if PHASE_1_ENABLED else "⚠️ PHASE 1 Offline (legacy mode)"
+st.caption(f"Opportunity Intelligence Radar — CAÇA REAL • V9 + PHASE 1 — {status_msg}")
 
 c=get_db()
 stats=[
@@ -540,7 +584,7 @@ if st.button("🔎 IR PARA CAÇA",type="primary",use_container_width=True):
     with st.spinner("Milo lendo fontes públicas e Hunter peneirando evidências..."):
         try:
             r=run_hunt()
-            st.success(f"Caça #{r[0]} concluída — {r[1]} fontes | {r[2]} sinais novos | {r[3]} empresas | {r[4]} novas oportunidades | {r[5]} atualizadas | {r[6]} sinais sem empresa no banco | {r[7]} sinais sem empresa nesta caça.")
+            st.success(f"Caça #{r[0]} concluída — {r[1]} fontes | {r[2]} sinais novos | {r[3]} empresas | {r[4]} novas oportunidades | {r[5]} atualizadas | {r[6]} sinais sem empresa")
         except Exception as ex:
             st.error(f"Erro na caça: {ex}")
 
@@ -576,11 +620,11 @@ rows=[]
 for o in opportunities():
     evs=evidence(o["id"])
     for v in evs or [None]:
-        rows.append({"Company":o["name"],"Website":o["website"],"ICP Fit":o["icp"],"Business Trigger":o["trigger_text"],"Need Signal":o["need"],"Pain/Risk":o["pain"],"Buying Intent":o["intent"],"Decision Maker":o["dm"],"Timing":o["timing"],"Opportunity Score":o["score"],"Confidence":o["confidence"],"Classification":o["classification"],"Next Action":o["next_action"],"Source":v["title"] if v else "","Source URL":v["url"] if v else "","Evidence":v["evidence"] if v else "","Collected Date":v["collected_at"] if v else ""})
+        rows.append({"Company":o["name"],"Website":o["website"],"ICP Fit":o["icp"],"Business Trigger":o["trigger_text"],"Need Signal":o["need"],"Pain/Risk":o["pain"],"Buying Intent":o["intent"],"Decision Maker":o["dm"],"Score":o["score"]})
 df=pd.DataFrame(rows)
 st.download_button("⬇️ Exportar CSV",df.to_csv(index=False).encode("utf-8-sig"),"hunter_techs.csv","text/csv")
 sigrows=[]
-for s in all_signals(): sigrows.append({"Company":s["company"] or "","Signal Type":s["kind"],"Evidence":s["evidence"],"Confidence":s["confidence"],"Source Type":s["source_type"] or "","Source":s["title"] or "","Source URL":s["url"] or "","Collected Date":s["collected_at"] or ""})
+for s in all_signals(): sigrows.append({"Company":s["company"] or "","Signal Type":s["kind"],"Evidence":s["evidence"],"Confidence":s["confidence"],"Source Type":s["source_type"] or "","Source":s["title"] or ""})
 sdf=pd.DataFrame(sigrows)
 st.download_button("⬇️ Exportar sinais do Milo CSV",sdf.to_csv(index=False).encode("utf-8-sig"),"hunter_techs_milo_signals.csv","text/csv")
 buf=io.BytesIO()
