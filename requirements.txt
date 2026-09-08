@@ -4,6 +4,3 @@ beautifulsoup4
 pandas
 openpyxl
 lxml
-spacy
-fuzzywuzzy
-python-Levenshtein
