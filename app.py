@@ -21,45 +21,48 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 # ============================================================
 
 SEARCH_QUERIES = [
-    '"RFP" TI OR tecnologia OR segurança OR infraestrutura',
-    '"RFQ" TI OR tecnologia OR segurança OR infraestrutura',
-    '"solicitação de proposta" tecnologia OR TI',
-    '"pedido de cotação" tecnologia OR TI',
-    '"busca de fornecedor" tecnologia OR TI',
-    '"procura fornecedor" segurança OR TI OR infraestrutura',
-    '"licitação" segurança da informação OR TI',
-    '"contratação" "serviços de TI"',
-    '"contratação" cibersegurança OR cybersecurity',
-    '"contratação" backup OR monitoramento OR infraestrutura',
-    '"empresa" "migração para nuvem" tecnologia',
-    '"empresa" "modernização da infraestrutura"',
-    '"empresa" "transformação digital" TI',
-    '"novo CIO" empresa',
-    '"novo CTO" empresa',
+    # COMPRA / PROJETO REAL — linguagem empresarial, sem governo/licitação
+    '"RFP" "segurança da informação" empresa',
+    '"RFQ" tecnologia empresa',
+    '"request for proposal" cybersecurity company',
+    '"request for quotation" IT company',
+    '"busca de fornecedor" tecnologia empresa',
+    '"seleção de fornecedor" tecnologia empresa',
+    '"buscando fornecedor" TI empresa',
+    '"buscando parceiro" "segurança" empresa',
+    '"parceiro de tecnologia" "segurança" empresa',
+    '"serviços gerenciados" "empresa" TI',
+    '"MSSP" empresa segurança',
+    '"SOC" empresa "fornecedor"',
+    '"EDR" empresa "fornecedor"',
+    '"backup" empresa "fornecedor"',
+    '"firewall" empresa "fornecedor"',
+    '"SASE" empresa "fornecedor"',
+    # DOR OPERACIONAL REAL
+    'empresa ransomware "infraestrutura"',
+    'empresa "incidente de segurança" "TI"',
+    'empresa "indisponibilidade" "sistemas"',
+    'empresa "falha de infraestrutura" TI',
+    'empresa "perda de dados" tecnologia',
+    'empresa "vulnerabilidade" "infraestrutura"',
+    'empresa "sobrecarga da equipe de TI"',
+    'empresa "falta de equipe" TI segurança',
+    'empresa "monitoramento 24x7" TI',
+    'empresa "continuidade de negócios" TI',
+    'empresa "disaster recovery" TI',
+    # TRIGGERS QUE GERAM DEMANDA DE INFRA/SEGURANÇA
+    '"novo CIO" empresa infraestrutura',
+    '"novo CTO" empresa infraestrutura',
     '"novo diretor de TI" empresa',
     '"novo gerente de TI" empresa',
-    '"expansão" "infraestrutura de TI"',
-    '"expansão" "segurança da informação"',
-    '"novas unidades" tecnologia infraestrutura',
-    '"abertura de lojas" tecnologia infraestrutura',
-    '"data center" expansão empresa',
-    '"ransomware" empresa',
-    '"ataque cibernético" empresa',
-    '"incidente de segurança" empresa',
-    '"vazamento de dados" empresa',
-    '"indisponibilidade" sistemas empresa',
-    '"downtime" empresa tecnologia',
-    '"falha" infraestrutura de TI empresa',
-    '"backup" empresa "continuidade"',
-    '"disaster recovery" empresa',
-    '"SOC" empresa segurança',
-    '"MSSP" empresa',
-    '"EDR" empresa',
-    '"RMM" empresa',
-    '"SASE" empresa',
-    '"firewall" empresa contratação',
-    '"monitoramento" infraestrutura empresa contratação',
-    '"serviços gerenciados" TI empresa',
+    'empresa "migração para cloud"',
+    'empresa "migração para nuvem" infraestrutura',
+    'empresa "modernização da infraestrutura"',
+    'empresa "expansão" "infraestrutura de TI"',
+    'empresa "novas unidades" infraestrutura TI',
+    'empresa "data center" expansão',
+    'empresa aquisição "infraestrutura de TI"',
+    'empresa fusão "infraestrutura de TI"',
 ]
 
 INTENT_STRONG = [
@@ -116,6 +119,28 @@ MEDIA_DOMAINS = {
     "reuters.com", "bloomberg.com", "infomoney.com.br", "canaltech.com.br",
     "tecmundo.com.br", "olhardigital.com.br", "itforum.com.br",
 }
+
+# Fontes que nunca podem virar evidência comercial final.
+EXCLUDED_DOMAINS = {
+    "pncp.gov.br", "compras.gov.br", "gov.br", "bcb.gov.br",
+    "tcu.gov.br", "tce.sp.gov.br", "tce.rj.gov.br",
+    "jus.br", "leg.br", "camara.leg.br", "senado.leg.br",
+}
+
+EXCLUDED_SOURCE_TERMS = [
+    "licitação", "licitacao", "edital", "pregão", "pregao",
+    "dispensa de licitação", "dispensa de licitacao", "pregão eletrônico",
+    "pregao eletronico", "processo licitatório", "processo licitatorio",
+    "compras públicas", "compras publicas", "órgão público", "orgao publico",
+    "prefeitura", "município", "municipio", "secretaria de", "estado do",
+]
+
+B2B_DIRECT_TERMS = [
+    "fornecedor", "fornecedores", "parceiro", "parceiros", "rfp", "rfq",
+    "request for proposal", "request for quotation", "mssP", "soc", "edr",
+    "rmm", "sase", "backup", "firewall", "serviços gerenciados",
+    "servicos gerenciados", "monitoramento 24x7", "disaster recovery",
+]
 
 GENERIC_NAMES = {
     "empresa", "companhia", "organização", "organizacao", "grupo", "cliente",
@@ -415,6 +440,25 @@ def resolve_company(title, body, publisher, url, explicit_candidate, existing_na
         diag_example(diag, title, candidates[0][1], "CANDIDATE_NOT_CONFIRMED", "news", url)
     return "", "", "NOT_RESOLVED"
 
+def is_excluded_source(url, text=""):
+    host = source_domain(url)
+    if any(host == d or host.endswith("." + d) for d in EXCLUDED_DOMAINS):
+        return True
+    low = str(text or "").lower()
+    return any(has_term(low, x) for x in EXCLUDED_SOURCE_TERMS)
+
+def is_media_source(url):
+    host = source_domain(url)
+    return host in MEDIA_DOMAINS or any(host.endswith("." + d) for d in MEDIA_DOMAINS)
+
+def is_direct_b2b_source(url, title="", body=""):
+    if is_excluded_source(url, title + " " + body):
+        return False
+    if is_media_source(url):
+        return False
+    # Domínio próprio / institucional: é elegível como evidência final.
+    return bool(source_domain(url))
+
 # ============================================================
 # SIGNAL VALIDATOR
 # ============================================================
@@ -435,9 +479,11 @@ def is_hiring_signal(text):
         "processo seletivo", "recrutamento",
     ])
 
-def validate_buying_intent(evidence, source_type="NEWS"):
-    if source_type == "PNCP":
-        return "HIGH"
+def validate_buying_intent(evidence, source_type="NEWS", direct_source=False):
+    # Buying Intent só existe quando há comportamento de compra observável.
+    # Notícia, governo, licitação ou simples trigger jamais geram intent.
+    if not direct_source or source_type in ("NEWS", "DISCOVERY", "GOV"):
+        return "NONE"
     if is_hiring_signal(evidence):
         return "NONE"
     strong = term_hits(evidence, INTENT_STRONG)
@@ -647,6 +693,34 @@ def db():
 # COLETA
 # ============================================================
 
+def web_search(query, limit=10):
+    """Busca web aberta sem API paga. O resultado serve para descobrir páginas;
+    a evidência comercial só é aceita depois que a página final é acessada e validada.
+    """
+    rows = []
+    try:
+        url = f"https://www.bing.com/search?q={quote_plus(query)}&count={limit}&setlang=pt-BR"
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        for li in soup.select("li.b_algo"):
+            a = li.select_one("h2 a")
+            if not a:
+                continue
+            href = a.get("href", "")
+            title = clean_text(a.get_text(" ", strip=True))
+            snippet = clean_text((li.select_one(".b_caption") or li).get_text(" ", strip=True))
+            if href.startswith("http") and title:
+                rows.append({
+                    "title": title, "url": href, "body": snippet,
+                    "publisher": source_domain(href), "source_type": "WEB",
+                    "published_at": "", "query": query,
+                })
+    except Exception:
+        pass
+    return rows
+
+
 def rss_search(query):
     url = f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=pt-BR&gl=BR&ceid=BR:pt-419"
     try:
@@ -833,18 +907,17 @@ def classify_company(company_name, signals):
             "score": 0, "confidence": "LOW", "classification": "IGNORE"
         }
 
-    # Trigger sozinho não gera oportunidade.
-    if intent == "NONE" and need == "NONE" and pain == "NONE":
-        classification = "IGNORE"
-    elif icp == "UNKNOWN":
-        classification = "WATCH"
-    elif intent in ("HIGH", "VERY HIGH") and need in ("MEDIUM", "HIGH") and score >= 75:
+    # GATE COMERCIAL: oportunidade real exige ICP + Buying Intent + demanda/dor.
+    # Trigger isolado, notícia, contratação de pessoa ou tecnologia genérica = WATCH.
+    if icp == "UNKNOWN":
+        classification = "WATCH" if any(x != "NONE" for x in [intent, need, pain, trigger]) else "IGNORE"
+    elif intent == "HIGH" and need in ("MEDIUM", "HIGH") and pain in ("MEDIUM", "HIGH") and score >= 80:
         classification = "HOT"
-    elif intent in ("HIGH", "VERY HIGH") and need in ("MEDIUM", "HIGH") and score >= 55:
+    elif intent == "HIGH" and need in ("MEDIUM", "HIGH") and (pain != "NONE") and score >= 60:
         classification = "WARM"
     elif intent == "MEDIUM" and need in ("MEDIUM", "HIGH"):
         classification = "WATCH"
-    elif pain != "NONE" or trigger != "NONE" or need != "NONE" or intent != "NONE":
+    elif pain != "NONE" or trigger != "NONE" or need != "NONE":
         classification = "WATCH"
     else:
         classification = "IGNORE"
@@ -943,6 +1016,8 @@ def reprocess_unassigned_sources(conn, diag, limit=1000):
     resolved = 0
     for row in rows:
         diag["reprocessed"] += 1
+        if not is_direct_b2b_source(row["url"] or "", row["title"] or "", row["content"] or ""):
+            continue
         name, origin, _ = resolve_company(
             row["title"] or "", row["content"] or "", row["publisher"] or "",
             row["url"] or "", "", existing, diag
@@ -984,12 +1059,12 @@ def run_hunt():
                 collected.append(item)
         progress.progress(int((i + 1) / total_q * 60), text=f"MILO: consulta {i+1}/{total_q}")
 
-    pncp = pncp_search()
-    for item in pncp:
-        key = item["url"] + "|" + item.get("title", "")
-        if key not in seen:
-            seen.add(key)
-            collected.append(item)
+    # PNCP/GOV/LICITAÇÃO foram retirados da caça comercial.
+    # O Hunter é B2B privado: não transforma compras públicas em oportunidade TECHS.
+    collected = [
+        item for item in collected
+        if not is_excluded_source(item.get("url", ""), item.get("title", "") + " " + item.get("body", ""))
+    ]
 
     diag["sources"] = len(collected)
 
@@ -1002,7 +1077,9 @@ def run_hunt():
     candidates = []
     for item in collected:
         text = f"{item.get('title','')} {item.get('body','')}"
-        if item.get("source_type") == "PNCP" or term_hits(text, INTENT_STRONG + TECH_TERMS + TRIGGER_TERMS + PAIN_TERMS):
+        # Notícias são apenas descoberta e não entram no funil comercial.
+        # Processamos somente URLs que possam representar evidência B2B direta.
+        if is_direct_b2b_source(item.get("url", ""), item.get("title", ""), item.get("body", "")) and term_hits(text, INTENT_STRONG + TECH_TERMS + TRIGGER_TERMS + PAIN_TERMS):
             candidates.append(item)
 
     max_candidates = min(len(candidates), 250)
@@ -1062,7 +1139,11 @@ def run_hunt():
         kinds = classify_signal_type(evidence_text)
         generated = []
 
-        intent_conf = validate_buying_intent(evidence_text, source_type)
+        direct_source = is_direct_b2b_source(url, title, evidence_text)
+        if not direct_source:
+            # Descoberta sem valor comercial final: fonte é preservada, mas não gera sinal.
+            continue
+        intent_conf = validate_buying_intent(evidence_text, source_type, direct_source=direct_source)
         if intent_conf != "NONE":
             for ev in evidence_snippets(evidence_text, INTENT_STRONG + INTENT_CONTEXT, 2):
                 generated.append(("BUYING_INTENT", ev, intent_conf))
@@ -1132,7 +1213,7 @@ st.caption("MILO → evidência pública → resolução de entidade → HUNTER 
 cols = st.columns(5)
 companies_count = conn.execute("SELECT COUNT(*) c FROM companies").fetchone()["c"]
 signals_count = conn.execute("SELECT COUNT(*) c FROM signals").fetchone()["c"]
-opp_count = conn.execute("SELECT COUNT(*) c FROM opportunities WHERE classification!='IGNORE'").fetchone()["c"]
+opp_count = conn.execute("SELECT COUNT(*) c FROM opportunities WHERE classification IN ('HOT','WARM')").fetchone()["c"]
 hot_count = conn.execute("SELECT COUNT(*) c FROM opportunities WHERE classification='HOT'").fetchone()["c"]
 warm_count = conn.execute("SELECT COUNT(*) c FROM opportunities WHERE classification='WARM'").fetchone()["c"]
 
@@ -1141,6 +1222,8 @@ cols[1].metric("Sinais", signals_count)
 cols[2].metric("Oportunidades", opp_count)
 cols[3].metric("HOT", hot_count)
 cols[4].metric("WARM", warm_count)
+watch_count = conn.execute("SELECT COUNT(*) c FROM opportunities WHERE classification='WATCH'").fetchone()["c"]
+st.caption(f"WATCH / monitoramento: {watch_count} | Oportunidade comercial: somente HOT + WARM")
 
 if st.button("🚀 IR PARA CAÇA", type="primary", use_container_width=True):
     with st.spinner("Caça em andamento..."):
@@ -1190,7 +1273,7 @@ with tab1:
     rows = conn.execute("""
         SELECT o.*, c.name company, c.icp
         FROM opportunities o JOIN companies c ON c.id=o.company_id
-        WHERE o.classification!='IGNORE'
+        WHERE o.classification IN ('HOT','WARM')
         ORDER BY o.score DESC, o.updated_at DESC
     """).fetchall()
     if rows:
@@ -1236,4 +1319,4 @@ with tab4:
         st.info("Nenhuma caça registrada.")
 
 st.divider()
-st.caption("Diagnóstico ativo: a aplicação preserva sinais mesmo quando a empresa não é resolvida. O domínio da fonte nunca é gravado como site da empresa.")
+st.caption("V11 — Caça B2B privada: notícias, governo e licitações não entram como oportunidade. WATCH é monitoramento; oportunidade comercial exige Buying Intent + Need/Pain.")
