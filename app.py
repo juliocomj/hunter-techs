@@ -572,6 +572,74 @@ def db():
         unassigned INTEGER DEFAULT 0,
         discarded INTEGER DEFAULT 0
     )""")
+    # --------------------------------------------------------
+    # MIGRAÇÃO COMPATÍVEL COM O hunter.db EXISTENTE
+    # CREATE TABLE IF NOT EXISTS não altera tabelas antigas.
+    # As versões anteriores do HUNTER podem ter criado a tabela
+    # hunts com menos colunas, causando OperationalError no INSERT.
+    # --------------------------------------------------------
+    migrations = {
+        "companies": {
+            "website": "TEXT DEFAULT ''",
+            "icp": "TEXT DEFAULT 'UNKNOWN'",
+            "created_at": "TEXT",
+            "updated_at": "TEXT",
+        },
+        "sources": {
+            "company_id": "INTEGER",
+            "title": "TEXT",
+            "url": "TEXT",
+            "source_type": "TEXT",
+            "publisher": "TEXT",
+            "collected_at": "TEXT",
+            "content": "TEXT",
+            "published_at": "TEXT",
+            "query": "TEXT",
+        },
+        "signals": {
+            "company_id": "INTEGER",
+            "source_id": "INTEGER",
+            "kind": "TEXT",
+            "evidence": "TEXT",
+            "evidence_type": "TEXT",
+            "confidence": "TEXT",
+            "created_at": "TEXT",
+        },
+        "opportunities": {
+            "company_id": "INTEGER",
+            "trigger_text": "TEXT",
+            "need": "TEXT",
+            "pain": "TEXT",
+            "intent": "TEXT",
+            "dm": "TEXT",
+            "timing": "TEXT",
+            "score": "INTEGER",
+            "confidence": "TEXT",
+            "classification": "TEXT",
+            "next_action": "TEXT",
+            "reason": "TEXT",
+            "created_at": "TEXT",
+            "updated_at": "TEXT",
+        },
+        "hunts": {
+            "started_at": "TEXT",
+            "finished_at": "TEXT",
+            "sources_found": "INTEGER DEFAULT 0",
+            "signals_found": "INTEGER DEFAULT 0",
+            "companies_found": "INTEGER DEFAULT 0",
+            "new_opportunities": "INTEGER DEFAULT 0",
+            "updated_opportunities": "INTEGER DEFAULT 0",
+            "unassigned": "INTEGER DEFAULT 0",
+            "discarded": "INTEGER DEFAULT 0",
+        },
+    }
+
+    for table, columns in migrations.items():
+        existing_cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        for column, definition in columns.items():
+            if column not in existing_cols:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
     conn.commit()
     return conn
 
