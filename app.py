@@ -1,9 +1,7 @@
-
-import io
 import re
 import sqlite3
-import hashlib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from urllib.parse import quote_plus, urlparse
 
 import pandas as pd
@@ -14,181 +12,119 @@ from bs4 import BeautifulSoup
 st.set_page_config(page_title="HUNTER TECHS", page_icon="🔎", layout="wide")
 
 DB = "hunter.db"
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36"}
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36"
+}
+MAX_DAYS = 5
+HOT_DAYS = 3
 
 # ============================================================
-# CONFIGURAÇÃO
+# HUNTER V12 — HOT SOURCE HUNTER
+# Regra central: empresa privada + dor atual + evidência + intent.
+# Governo/licitação não participa da caça comercial.
 # ============================================================
 
 SEARCH_QUERIES = [
-    # COMPRA / PROJETO REAL — linguagem empresarial, sem governo/licitação
-    '"RFP" "segurança da informação" empresa',
-    '"RFQ" tecnologia empresa',
-    '"request for proposal" cybersecurity company',
-    '"request for quotation" IT company',
-    '"busca de fornecedor" tecnologia empresa',
-    '"seleção de fornecedor" tecnologia empresa',
-    '"buscando fornecedor" TI empresa',
-    '"buscando parceiro" "segurança" empresa',
-    '"parceiro de tecnologia" "segurança" empresa',
-    '"serviços gerenciados" "empresa" TI',
-    '"MSSP" empresa segurança',
-    '"SOC" empresa "fornecedor"',
-    '"EDR" empresa "fornecedor"',
-    '"backup" empresa "fornecedor"',
-    '"firewall" empresa "fornecedor"',
-    '"SASE" empresa "fornecedor"',
-    # DOR OPERACIONAL REAL
-    'empresa ransomware "infraestrutura"',
-    'empresa "incidente de segurança" "TI"',
-    'empresa "indisponibilidade" "sistemas"',
-    'empresa "falha de infraestrutura" TI',
-    'empresa "perda de dados" tecnologia',
-    'empresa "vulnerabilidade" "infraestrutura"',
-    'empresa "sobrecarga da equipe de TI"',
-    'empresa "falta de equipe" TI segurança',
-    'empresa "monitoramento 24x7" TI',
-    'empresa "continuidade de negócios" TI',
-    'empresa "disaster recovery" TI',
-    # TRIGGERS QUE GERAM DEMANDA DE INFRA/SEGURANÇA
-    '"novo CIO" empresa infraestrutura',
-    '"novo CTO" empresa infraestrutura',
-    '"novo diretor de TI" empresa',
-    '"novo gerente de TI" empresa',
-    'empresa "migração para cloud"',
-    'empresa "migração para nuvem" infraestrutura',
-    'empresa "modernização da infraestrutura"',
-    'empresa "expansão" "infraestrutura de TI"',
-    'empresa "novas unidades" infraestrutura TI',
-    'empresa "data center" expansão',
-    'empresa aquisição "infraestrutura de TI"',
-    'empresa fusão "infraestrutura de TI"',
+    # BUYING INTENT — prioridade máxima
+    '"RFP" "segurança da informação" empresa -gov -gov.br -prefeitura -licitação',
+    '"RFQ" TI empresa fornecedor -gov -gov.br -licitação',
+    '"request for proposal" cybersecurity company Brazil -government',
+    '"request for quotation" IT company Brazil -government',
+    '"buscando fornecedor" TI empresa -gov -licitação',
+    '"busca de fornecedor" segurança empresa -gov -licitação',
+    '"seleção de fornecedor" tecnologia empresa -gov -licitação',
+    '"procura fornecedor" infraestrutura TI empresa -gov -licitação',
+    '"serviços gerenciados" "fornecedor" empresa TI -gov',
+    '"MSSP" "fornecedor" empresa -gov',
+    '"SOC" "fornecedor" empresa segurança -gov',
+    '"backup" "fornecedor" empresa TI -gov',
+    '"firewall" "fornecedor" empresa -gov',
+    '"monitoramento 24x7" "fornecedor" empresa -gov',
+    # PAIN / INCIDENTE — últimos dias
+    'empresa ransomware infraestrutura TI -gov -gov.br',
+    'empresa "ataque cibernético" sistemas -gov -gov.br',
+    'empresa "incidente de segurança" TI -gov -gov.br',
+    'empresa "vazamento de dados" sistemas -gov -gov.br',
+    'empresa "indisponibilidade" sistemas TI -gov -gov.br',
+    'empresa "falha de infraestrutura" TI -gov -gov.br',
+    'empresa "perda de dados" TI -gov -gov.br',
+    'empresa vulnerabilidade infraestrutura segurança -gov -gov.br',
+    'empresa "interrupção" sistemas tecnologia -gov -gov.br',
+    # PRESSÃO OPERACIONAL / CONTINUIDADE
+    'empresa "sobrecarga" "equipe de TI" -gov',
+    'empresa "falta de equipe" TI segurança -gov',
+    'empresa "continuidade de negócios" infraestrutura TI -gov',
+    'empresa "disaster recovery" infraestrutura -gov',
+    # TRIGGERS RECENTES QUE PODEM GERAR DEMANDA
+    'empresa "novo CIO" infraestrutura -gov',
+    'empresa "novo CTO" infraestrutura -gov',
+    'empresa "novo diretor de TI" -gov',
+    'empresa "migração para nuvem" infraestrutura -gov',
+    'empresa "modernização da infraestrutura" TI -gov',
+    'empresa "expansão" "infraestrutura de TI" -gov',
+    'empresa "novas unidades" infraestrutura TI -gov',
+    'empresa aquisição "infraestrutura de TI" -gov',
+    'empresa fusão "infraestrutura de TI" -gov',
 ]
 
 INTENT_STRONG = [
     "rfp", "rfq", "request for proposal", "request for quotation",
     "solicitação de proposta", "solicitacao de proposta",
     "pedido de cotação", "pedido de cotacao",
-    "busca de fornecedor", "procura fornecedor",
-    "procura por fornecedor", "supplier search",
-    "tender", "procurement", "vendor selection", "vendor change",
-    "seleção de fornecedor", "selecao de fornecedor",
+    "busca de fornecedor", "buscando fornecedor", "procura fornecedor",
+    "seleção de fornecedor", "selecao de fornecedor", "vendor selection",
+    "supplier search", "vendor change", "procura por fornecedor",
     "cotação de fornecedor", "cotacao de fornecedor",
-    "licitação", "licitacao", "edital", "pregão", "pregao",
-    "contratação de serviços", "contratacao de servicos",
 ]
-INTENT_CONTEXT = ["cotação", "cotacao", "orçamento", "orcamento", "comprar", "aquisição", "aquisicao", "contratar", "contratação", "contratacao"]
+INTENT_CONTEXT = ["cotação", "cotacao", "orçamento", "orcamento", "comprar", "contratar", "contratação", "contratacao", "fornecedor", "parceiro"]
 TECH_TERMS = [
-    "rmm", "edr", "xdr", "backup", "monitoramento", "monitorização",
-    "endpoint", "endpoints", "firewall", "sase", "soc", "mssp",
-    "segurança da informação", "seguranca da informacao", "cibersegurança",
-    "ciberseguranca", "cybersecurity", "infraestrutura", "infraestrutura de ti",
-    "serviços gerenciados", "servicos gerenciados", "cloud", "nuvem",
-    "disaster recovery", "continuidade", "governança", "governanca",
-    "gestão de ti", "gestao de ti", "ti",
+    "rmm", "edr", "xdr", "backup", "monitoramento", "monitorização", "endpoint", "endpoints",
+    "firewall", "sase", "soc", "mssp", "segurança da informação", "seguranca da informacao",
+    "cibersegurança", "ciberseguranca", "cybersecurity", "infraestrutura de ti", "infraestrutura",
+    "serviços gerenciados", "servicos gerenciados", "cloud", "nuvem", "disaster recovery",
+    "continuidade de negócios", "continuidade de negocios", "gestão de ti", "gestao de ti",
 ]
 TRIGGER_TERMS = [
-    "novo cio", "novo cto", "novo diretor de ti", "novo gerente de ti",
-    "expansão", "expansao", "aquisição", "aquisicao", "fusão", "fusao",
-    "transformação digital", "transformacao digital", "migração para nuvem",
-    "migracao para nuvem", "modernização", "modernizacao",
-    "novas unidades", "novas lojas", "abertura de lojas", "data center",
-    "erp", "incidente de segurança", "incidente de seguranca",
+    "novo cio", "novo cto", "novo diretor de ti", "novo gerente de ti", "expansão", "expansao",
+    "aquisição", "aquisicao", "fusão", "fusao", "transformação digital", "transformacao digital",
+    "migração para nuvem", "migracao para nuvem", "modernização", "modernizacao", "novas unidades",
+    "novas lojas", "abertura de lojas", "data center", "incidente de segurança", "incidente de seguranca",
 ]
 PAIN_TERMS = [
-    "downtime", "indisponibilidade", "falha", "falhas", "ataque", "ransomware",
-    "vulnerabilidade", "risco", "interrupção", "interrupcao", "perda de dados",
-    "data loss", "incidente", "sobrecarga", "equipe reduzida", "falta de equipe",
+    "downtime", "indisponibilidade", "falha de infraestrutura", "falha", "falhas", "ataque",
+    "ransomware", "vulnerabilidade", "interrupção", "interrupcao", "perda de dados", "data loss",
+    "incidente de segurança", "incidente de seguranca", "sobrecarga", "falta de equipe", "equipe reduzida",
 ]
 DM_TERMS = [
-    "cio", "cto", "diretor de ti", "diretor de tecnologia", "gerente de ti",
-    "gerente de tecnologia", "head de tecnologia", "head of technology",
-    "diretor de segurança", "diretor de infraestrutura", "ciso", "it manager",
+    "cio", "cto", "ciso", "diretor de ti", "diretor de tecnologia", "gerente de ti",
+    "gerente de tecnologia", "head de tecnologia", "head of technology", "diretor de segurança",
+    "diretor de infraestrutura", "it manager",
 ]
 
-MEDIA_NAMES = {
-    "google news", "g1", "globo", "uol", "exame", "valor", "estadao",
-    "estadão", "folha", "terra", "cnn", "forbes", "reuters", "bloomberg",
-    "infomoney", "canaltech", "tecmundo", "olhar digital", "computerworld",
-    "it forum", "ti inside", "startse", "convergencia digital",
-}
 MEDIA_DOMAINS = {
-    "news.google.com", "google.com", "g1.globo.com", "oglobo.globo.com",
-    "exame.com", "valor.globo.com", "estadao.com.br", "folha.uol.com.br",
-    "uol.com.br", "terra.com.br", "cnnbrasil.com.br", "forbes.com",
-    "reuters.com", "bloomberg.com", "infomoney.com.br", "canaltech.com.br",
-    "tecmundo.com.br", "olhardigital.com.br", "itforum.com.br",
+    "news.google.com", "google.com", "g1.globo.com", "oglobo.globo.com", "exame.com",
+    "valor.globo.com", "estadao.com.br", "folha.uol.com.br", "uol.com.br", "terra.com.br",
+    "cnnbrasil.com.br", "forbes.com", "reuters.com", "bloomberg.com", "infomoney.com.br",
+    "canaltech.com.br", "tecmundo.com.br", "olhardigital.com.br", "itforum.com.br",
+    "convergenciadigital.com.br", "prnewswire.com", "startse.com",
 }
-
-# Fontes que nunca podem virar evidência comercial final.
-EXCLUDED_DOMAINS = {
-    "pncp.gov.br", "compras.gov.br", "gov.br", "bcb.gov.br",
-    "tcu.gov.br", "tce.sp.gov.br", "tce.rj.gov.br",
-    "jus.br", "leg.br", "camara.leg.br", "senado.leg.br",
+GOV_DOMAINS = {
+    "gov.br", "pncp.gov.br", "compras.gov.br", "tcu.gov.br", "bcb.gov.br", "jus.br", "leg.br",
+    "camara.leg.br", "senado.leg.br", "tce.sp.gov.br", "tce.rj.gov.br",
 }
-
-EXCLUDED_SOURCE_TERMS = [
-    "licitação", "licitacao", "edital", "pregão", "pregao",
-    "dispensa de licitação", "dispensa de licitacao", "pregão eletrônico",
-    "pregao eletronico", "processo licitatório", "processo licitatorio",
-    "compras públicas", "compras publicas", "órgão público", "orgao publico",
-    "prefeitura", "município", "municipio", "secretaria de", "estado do",
+GOV_TERMS = [
+    "governo federal", "órgão público", "orgao publico", "prefeitura", "município", "municipio",
+    "ministério", "ministerio", "secretaria de estado", "tribunal de contas", "tcu", "pncp",
+    "licitação", "licitacao", "edital", "pregão", "pregao", "dispensa de licitação",
+    "compras públicas", "compras publicas", "contratação pública", "contratacao publica",
 ]
-
-B2B_DIRECT_TERMS = [
-    "fornecedor", "fornecedores", "parceiro", "parceiros", "rfp", "rfq",
-    "request for proposal", "request for quotation", "mssP", "soc", "edr",
-    "rmm", "sase", "backup", "firewall", "serviços gerenciados",
-    "servicos gerenciados", "monitoramento 24x7", "disaster recovery",
-]
-
 GENERIC_NAMES = {
-    "empresa", "companhia", "organização", "organizacao", "grupo", "cliente",
-    "fornecedor", "governo", "prefeitura", "estado", "município", "municipio",
-    "brasil", "mercado", "setor", "indústria", "industria", "banco",
+    "empresa", "companhia", "organização", "organizacao", "grupo", "cliente", "fornecedor",
+    "governo", "prefeitura", "estado", "município", "municipio", "brasil", "mercado", "setor",
 }
 
 # ============================================================
-# DIAGNÓSTICO
-# ============================================================
-
-def empty_diag():
-    return {
-        "sources": 0,
-        "candidate_extracted": 0,
-        "candidate_rejected": 0,
-        "resolved_existing": 0,
-        "resolved_new": 0,
-        "not_resolved": 0,
-        "signals_total": 0,
-        "signals_with_company": 0,
-        "signals_without_company": 0,
-        "reject_invalid": 0,
-        "reject_media": 0,
-        "reject_generic": 0,
-        "reject_short": 0,
-        "reject_long": 0,
-        "domain_candidate": 0,
-        "title_candidate": 0,
-        "body_candidate": 0,
-        "explicit_candidate": 0,
-        "examples": [],
-        "reprocessed": 0,
-        "reprocessed_resolved": 0,
-    }
-
-def diag_example(diag, title, candidate, reason, source_type="", url=""):
-    if len(diag["examples"]) < 20:
-        diag["examples"].append({
-            "Título": title[:180],
-            "Candidato": candidate or "",
-            "Motivo": reason,
-            "Tipo": source_type,
-            "URL": url[:180],
-        })
-
-# ============================================================
-# TEXTO / MATCH
+# UTILITÁRIOS
 # ============================================================
 
 def norm(s):
@@ -197,362 +133,171 @@ def norm(s):
 def clean_text(s):
     return norm(BeautifulSoup(str(s or ""), "html.parser").get_text(" ", strip=True))
 
-def term_pattern(term):
-    t = re.escape(term.lower().strip())
-    # Acrônimos/termos curtos precisam de fronteira de palavra.
-    if len(term.strip()) <= 3:
-        return rf"(?<!\w){t}(?!\w)"
-    return t
+def source_domain(url):
+    try:
+        host = (urlparse(url).netloc or "").lower().split(":")[0]
+        return host[4:] if host.startswith("www.") else host
+    except Exception:
+        return ""
 
 def has_term(text, term):
-    return bool(re.search(term_pattern(term), str(text or "").lower()))
+    t = str(term).lower().strip()
+    if not t:
+        return False
+    if len(t) <= 3:
+        return bool(re.search(rf"(?<!\w){re.escape(t)}(?!\w)", str(text or "").lower()))
+    return t in str(text or "").lower()
 
 def term_hits(text, terms):
     return [t for t in terms if has_term(text, t)]
 
-def source_domain(url):
+def is_media(url):
+    host = source_domain(url)
+    return host in MEDIA_DOMAINS or any(host.endswith("." + d) for d in MEDIA_DOMAINS)
+
+def is_government_source(url):
+    host = source_domain(url)
+    return host in GOV_DOMAINS or any(host.endswith("." + d) for d in GOV_DOMAINS)
+
+def is_government_entity(name, text=""):
+    n = str(name or "").lower()
+    strong_name = ["tcu", "tce ", "prefeitura", "ministério", "ministerio", "secretaria", "tribunal de contas", "câmara municipal", "camara municipal", "senado", "câmara dos deputados", "camara dos deputados"]
+    if any(x in n for x in strong_name):
+        return True
+    # Só usamos contexto governamental para bloquear quando há sinais explícitos de compra pública.
+    gov = term_hits(text, GOV_TERMS)
+    return len(gov) >= 2 and not term_hits(text, ["empresa privada", "companhia privada", "grupo empresarial", "corporação"])
+
+def parse_date(value):
+    if not value:
+        return None
     try:
-        host = (urlparse(url).netloc or "").lower().split(":")[0]
-        if host.startswith("www."):
-            host = host[4:]
-        return host
+        dt = parsedate_to_datetime(str(value))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
     except Exception:
-        return ""
+        pass
+    for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(str(value)[:19], fmt).replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+    return None
+
+def freshness(published_at, title="", body=""):
+    dt = parse_date(published_at)
+    if not dt:
+        # Tenta recuperar uma data explícita da própria página/snippet.
+        text = str(body or "") + " " + str(title or "")
+        patterns = [
+            r"\b(20\d{2})[-/](0?[1-9]|1[0-2])[-/](0?[1-9]|[12]\d|3[01])\b",
+            r"\b(0?[1-9]|[12]\d|3[01])/(0?[1-9]|1[0-2])/(20\d{2})\b",
+        ]
+        for pat in patterns:
+            m = re.search(pat, text)
+            if not m:
+                continue
+            try:
+                if pat.startswith(r"\b(20"):
+                    dt = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), tzinfo=timezone.utc)
+                else:
+                    dt = datetime(int(m.group(3)), int(m.group(2)), int(m.group(1)), tzinfo=timezone.utc)
+                break
+            except Exception:
+                pass
+    if not dt:
+        return "UNKNOWN", 999
+    days = max(0, (datetime.now(timezone.utc) - dt).total_seconds() / 86400)
+    if days <= HOT_DAYS:
+        return "HOT", int(days)
+    if days <= MAX_DAYS:
+        return "WARM", int(days)
+    return "STALE", int(days)
 
 def valid_company(name):
     n = norm(name).strip(" -–—|,:;.")
     low = n.lower()
-    if not n or len(n) < 3 or len(n) > 120:
+    if not n or len(n) < 3 or len(n) > 120 or low in GENERIC_NAMES:
         return False
-    if low in GENERIC_NAMES or low in MEDIA_NAMES:
+    if any(x in low for x in ["google news", "reuters", "exame", "uol", "g1", "globo notícias", "globo noticias"]):
         return False
-    if any(x in low for x in ["google news", "reuters", "uol", "exame", "globo notícias", "globo noticias"]):
+    if len(n.split()) > 12 or len(re.findall(r"\d", n)) > 8:
         return False
-    if len(re.findall(r"\d", n)) > 8:
-        return False
-    if len(n.split()) > 14:
+    if is_government_entity(n, n):
         return False
     return True
 
 def clean_company(name):
-    if not name:
-        return ""
     n = norm(name)
     n = re.sub(r"^\s*(a|o|as|os|uma|um)\s+", "", n, flags=re.I)
     n = re.sub(r"\s*[-–—|]\s*(reuters|exame|valor|g1|uol|forbes|globo|estadão|estadao)\s*$", "", n, flags=re.I)
-    n = re.sub(r"^(empresa|companhia|grupo)\s+", "", n, flags=re.I)
     return n.strip(" -–—|,:;.")
 
-def validate_company_name(name):
-    return valid_company(clean_company(name))
-
 # ============================================================
-# ENTITY RESOLVER COM RASTREABILIDADE
+# ENTITY RESOLUTION
 # ============================================================
 
-def strip_publisher_suffix(title, publisher=""):
-    """Remove suffixes comuns de manchetes do Google News."""
-    t = clean_text(title)
-    if publisher:
-        t = re.sub(rf"\s+[|–—-]\s*{re.escape(clean_text(publisher))}\s*$", "", t, flags=re.I)
-    t = re.sub(r"\s+[|–—-]\s*(g1|uol|exame|valor|reuters|forbes|cnn brasil|terra|estadao|estadão)\s*$", "", t, flags=re.I)
-    return t.strip(" -–—|")
-
-LEGAL_SUFFIX_RE = re.compile(
-    r"\b(?:S\.?A\.?|S/A|Ltda\.?|Limitada|EIRELI|S\.A\.S\.?|Corp\.?|Corporation|Inc\.?|LLC|PLC|Holding|Participações|Participacoes)\b",
-    flags=re.I,
-)
-
-# Palavras que frequentemente aparecem como parte da manchete, mas não são empresa.
-ENTITY_STOPWORDS = {
-    "novo", "nova", "novos", "novas", "empresa", "companhia", "grupo", "mercado",
-    "setor", "indústria", "industria", "banco", "bancos", "rede", "redes", "varejo",
-    "tecnologia", "infraestrutura", "segurança", "seguranca", "cibersegurança",
-    "ciberseguranca", "cloud", "nuvem", "dados", "sistemas", "serviços", "servicos",
-    "contratação", "contratacao", "projeto", "projetos", "operação", "operacao",
-    "diretor", "diretora", "gerente", "gerentes", "cio", "cto", "ciso", "ti",
-    "fornecedor", "fornecedores", "cliente", "clientes", "especialista", "especialistas",
-    "anuncia", "anunciou", "inicia", "iniciou", "amplia", "ampliou", "expande", "expandiu",
-    "contrata", "contratou", "investe", "investiu", "adota", "adotou", "implementa",
-    "implementou", "migra", "migrou", "moderniza", "modernizou", "abre", "abriu", "lança", "lançou",
-    "busca", "procura", "planeja", "pretende", "vai", "é", "e", "para", "com", "sobre", "contra",
-}
-
-GENERIC_ENTITY_PHRASES = {
-    "sua empresa", "a empresa", "uma empresa", "companhia", "o grupo", "a companhia",
-    "mercado brasileiro", "mercado nacional", "setor de tecnologia", "setor financeiro",
-}
-
-def _candidate_quality(name):
-    """Pontua uma entidade textual; não é score comercial."""
-    c = clean_company(name)
-    if not c or not validate_company_name(c):
-        return -1
-    low = c.lower()
-    if low in GENERIC_ENTITY_PHRASES or low in GENERIC_NAMES or low in MEDIA_NAMES:
-        return -1
-    words = c.split()
-    score = 0
-    if LEGAL_SUFFIX_RE.search(c):
-        score += 80
-    if len(words) == 1:
-        score += 10
-    elif 2 <= len(words) <= 6:
-        score += 25
-    else:
-        score += 5
-    if any(w.lower() in ENTITY_STOPWORDS for w in words):
-        score -= 20
-    if re.search(r"\b(?:Ltda|S\.A\.?|S/A|Corp|Inc|Holding)\b", c, re.I):
-        score += 15
-    return score
-
-def _add_candidate(candidates, origin, value, strength=0):
-    c = clean_company(value)
-    if not c or not validate_company_name(c):
-        return
-    q = _candidate_quality(c) + strength
-    if q >= 0:
-        candidates.append((origin, c, q))
-
-def extract_company_candidates(title, body, publisher, url, explicit_candidate=""):
-    """Resolve entidades com prioridade: PNCP > entidade legal > sujeito da manchete > corpo.
-
-    Importante: regexes de nomes próprios NÃO usam re.I. Isso preserva a capitalização
-    original da manchete e reduz a captura de frases inteiras como se fossem empresas.
-    """
+def extract_company_candidates(title, body, url, explicit=""):
     candidates = []
-    title_clean = strip_publisher_suffix(title, publisher)
-    body_clean = clean_text(body)[:10000]
+    if explicit and valid_company(explicit):
+        candidates.append(("explicit", clean_company(explicit), 100))
 
-    if explicit_candidate:
-        _add_candidate(candidates, "explicit", explicit_candidate, 200)
-
-    # 1) Razão social / marca com sufixo jurídico.
-    legal_patterns = [
-        r"([A-ZÀ-Ý][A-Za-zÀ-ÿ0-9&.'’\-/]+(?:\s+[A-ZÀ-Ý][A-Za-zÀ-ÿ0-9&.'’\-/]+){0,7}\s+(?:S\.?A\.?|S/A|Ltda\.?|Limitada|EIRELI|Corp\.?|Corporation|Inc\.?|LLC|Holding))",
-        r"((?:[A-Z0-9À-Ý][A-Za-zÀ-ÿ0-9&.'’\-/]*\s+){1,6}(?:S\.?A\.?|S/A|Ltda\.?|Limitada|EIRELI|Corp\.?|Corporation|Inc\.?|LLC|Holding))",
+    # Manchetes do tipo: Empresa X anuncia / sofre / amplia / enfrenta...
+    patterns = [
+        r"^([A-ZÀ-Ý][A-Za-zÀ-ÿ0-9&.'’\-]*(?:\s+[A-ZÀ-Ý][A-Za-zÀ-ÿ0-9&.'’\-]*){0,7})\s+(?:anuncia|anunciou|inicia|iniciou|amplia|ampliou|expande|expandiu|enfrenta|sofre|sofreu|revela|revelou|adota|adotou|investe|investiu|planeja|busca|procura)",
+        r"^([A-ZÀ-Ý][A-Za-zÀ-ÿ0-9&.'’\-]*(?:\s+[A-ZÀ-Ý][A-Za-zÀ-ÿ0-9&.'’\-]*){0,7})\s+(?:tem|teve|é|e)\s+",
     ]
-    for pat in legal_patterns:
-        for txt, origin in [(title_clean, "title"), (body_clean[:5000], "body")]:
-            for m in re.finditer(pat, txt or ""):
-                _add_candidate(candidates, origin, m.group(1), 100)
-
-    # 2) Nome entre aspas: comum em notícias sobre uma empresa específica.
-    for txt, origin in [(title_clean, "title"), (body_clean[:5000], "body")]:
-        for m in re.finditer(r'["“”\']([^"“”\']{3,100})["“”\']', txt or ""):
-            value = m.group(1)
-            # Só aceita se parecer entidade, não frase verbal.
-            if len(value.split()) <= 8 and not any(has_term(value, x) for x in INTENT_STRONG):
-                _add_candidate(candidates, origin, value, 65)
-
-    # 3) Sujeito explícito no começo da manchete: "Empresa X anuncia..."
-    verbs = r"anuncia|anunciou|inicia|iniciou|amplia|ampliou|expande|expandiu|contrata|contratou|investe|investiu|adota|adotou|implementa|implementou|migra|migrou|moderniza|modernizou|abre|abriu|lança|lancou|lançou|busca|procura|planeja|pretende"
-    subject_patterns = [
-        rf"^([A-ZÀ-Ý][A-Za-zÀ-ÿ0-9&.'’\-/]*(?:\s+[A-ZÀ-Ý][A-Za-zÀ-ÿ0-9&.'’\-/]*){{0,5}})\s+(?:{verbs})\b",
-        rf"^([A-ZÀ-Ý][A-Za-zÀ-ÿ0-9&.'’\-/]*(?:\s+[A-ZÀ-Ý][A-Za-zÀ-ÿ0-9&.'’\-/]*){{0,4}})\s*[:,-]\s+(?:{verbs})\b",
-    ]
-    for pat in subject_patterns:
-        m = re.search(pat, title_clean or "")
+    for pat in patterns:
+        m = re.search(pat, title or "")
         if m:
-            _add_candidate(candidates, "title", m.group(1), 75)
+            c = clean_company(m.group(1))
+            if valid_company(c):
+                candidates.append(("title", c, 90))
 
-    # 4) Padrões linguísticos: "na Empresa", "da Empresa", "Empresa busca...".
-    prep_patterns = [
-        r"\b(?:na|no|em|da|do|das|dos|pela|pelo|para a|para o|junto à|junto ao)\s+([A-ZÀ-Ý][A-Za-zÀ-ÿ0-9&.'’\-/]*(?:\s+[A-ZÀ-Ý][A-Za-zÀ-ÿ0-9&.'’\-/]*){0,4})",
-        rf"\b([A-ZÀ-Ý][A-Za-zÀ-ÿ0-9&.'’\-/]*(?:\s+[A-ZÀ-Ý][A-Za-zÀ-ÿ0-9&.'’\-/]*){{0,4}})\s+(?:{verbs})\b",
+    # Nome corporativo explícito no corpo: "A Empresa X..." / "Empresa X, ..."
+    body_patterns = [
+        r"\b([A-ZÀ-Ý][A-Za-zÀ-ÿ0-9&.'’\-]*(?:\s+[A-ZÀ-Ý][A-Za-zÀ-ÿ0-9&.'’\-]*){0,6})\s+(?:anunciou|anuncia|informou|confirmou|revelou|sofreu|enfrenta|está|esta|passou|ampliou|expandiu)",
+        r"\b(?:a empresa|a companhia|o grupo)\s+([A-ZÀ-Ý][A-Za-zÀ-ÿ0-9&.'’\-]*(?:\s+[A-ZÀ-Ý][A-Za-zÀ-ÿ0-9&.'’\-]*){0,5})\b",
     ]
-    for pat in prep_patterns:
-        for m in re.finditer(pat, title_clean or ""):
-            _add_candidate(candidates, "title", m.group(1), 55)
-        for m in re.finditer(pat, body_clean[:5000] or ""):
-            _add_candidate(candidates, "body", m.group(1), 35)
+    for pat in body_patterns:
+        for m in re.finditer(pat, body[:10000] if body else ""):
+            c = clean_company(m.group(1))
+            if valid_company(c):
+                candidates.append(("body", c, 70))
+                break
 
-    # 5) Sequências de nomes próprios no título — SEM re.I.
-    # Permite marcas como "Mercado Livre", "Grupo ABC", etc., mas evita palavras genéricas.
-    tokens = re.findall(r"\b[A-ZÀ-Ý][A-Za-zÀ-ÿ0-9&.'’\-/]{2,}\b", title_clean or "")
-    for i in range(len(tokens)):
-        for size in range(min(6, len(tokens)-i), 0, -1):
-            phrase = " ".join(tokens[i:i+size])
-            words = phrase.split()
-            if len(words) == 1 and words[0].lower() in ENTITY_STOPWORDS:
-                continue
-            if any(w.lower() in ENTITY_STOPWORDS for w in words[:-1]):
-                continue
-            _add_candidate(candidates, "title", phrase, 45 if size >= 2 else 25)
-
-    # 6) Domínio: apenas diagnóstico, nunca empresa gravada automaticamente.
+    # Para página corporativa, o domínio pode ajudar SOMENTE como último recurso.
     host = source_domain(url)
-    if host and host not in MEDIA_DOMAINS:
-        base = host.split(".")[0].replace("-", " ").strip()
-        if base and validate_company_name(base):
-            _add_candidate(candidates, "domain_candidate", base, 5)
+    if host and not is_media(url) and not is_government_source(url):
+        base = host.split(".")[0].replace("-", " ")
+        if valid_company(base) and len(base) >= 4:
+            candidates.append(("domain", base.title(), 35))
 
-    # Deduplica pelo nome e mantém a evidência mais forte.
-    best = {}
-    priority = {"explicit": 0, "title": 1, "body": 2, "domain_candidate": 3}
-    for origin, c, q in candidates:
+    # dedupe
+    seen = set(); out = []
+    for origin, c, q in sorted(candidates, key=lambda x: -x[2]):
         key = re.sub(r"[^a-z0-9]+", " ", c.lower()).strip()
-        if key not in best or (q, -priority.get(origin, 9)) > (best[key][2], -priority.get(best[key][0], 9)):
-            best[key] = (origin, c, q)
+        if key not in seen:
+            seen.add(key); out.append((origin, c, q))
+    return out[:12]
 
-    result = sorted(best.values(), key=lambda x: (-x[2], priority.get(x[0], 9), len(x[1])))
-    return [(origin, c) for origin, c, _ in result[:12]]
-
-def resolve_company(title, body, publisher, url, explicit_candidate, existing_names, diag):
-    candidates = extract_company_candidates(title, body, publisher, url, explicit_candidate)
-
-    if candidates:
-        diag["candidate_extracted"] += 1
-
-    for origin, candidate in candidates:
-        if origin == "explicit":
-            diag["explicit_candidate"] += 1
-        elif origin == "title":
-            diag["title_candidate"] += 1
-        elif origin == "body":
-            diag["body_candidate"] += 1
-        elif origin == "domain_candidate":
-            diag["domain_candidate"] += 1
-
-        c = clean_company(candidate)
-        if not validate_company_name(c):
-            diag["candidate_rejected"] += 1
-            diag["reject_invalid"] += 1
+def resolve_company(title, body, url, existing):
+    candidates = extract_company_candidates(title, body, url)
+    for origin, c, _ in candidates:
+        if is_government_entity(c, title + " " + body):
             continue
-
-        cl = re.sub(r"[^a-z0-9]+", " ", c.lower()).strip()
-        for existing in existing_names:
-            el = re.sub(r"[^a-z0-9]+", " ", existing.lower()).strip()
-            if cl == el or (len(cl) >= 6 and (cl in el or el in cl)):
-                diag["resolved_existing"] += 1
-                return existing, origin, "EXISTING_MATCH"
-
-        # Domínio é diagnóstico apenas. Não cria empresa sem evidência textual.
+        key = re.sub(r"[^a-z0-9]+", " ", c.lower()).strip()
+        for e in existing:
+            ek = re.sub(r"[^a-z0-9]+", " ", e.lower()).strip()
+            if key == ek or (len(key) >= 7 and (key in ek or ek in key)):
+                return e, origin
         if origin in ("explicit", "title", "body"):
-            diag["resolved_new"] += 1
-            return c, origin, "NEW_ENTITY"
-
-    diag["not_resolved"] += 1
-    if not candidates:
-        diag_example(diag, title, "", "ENTITY_NOT_FOUND", "news", url)
-    else:
-        diag_example(diag, title, candidates[0][1], "CANDIDATE_NOT_CONFIRMED", "news", url)
-    return "", "", "NOT_RESOLVED"
-
-def is_excluded_source(url, text=""):
-    host = source_domain(url)
-    if any(host == d or host.endswith("." + d) for d in EXCLUDED_DOMAINS):
-        return True
-    low = str(text or "").lower()
-    return any(has_term(low, x) for x in EXCLUDED_SOURCE_TERMS)
-
-def is_media_source(url):
-    host = source_domain(url)
-    return host in MEDIA_DOMAINS or any(host.endswith("." + d) for d in MEDIA_DOMAINS)
-
-def is_direct_b2b_source(url, title="", body=""):
-    if is_excluded_source(url, title + " " + body):
-        return False
-    if is_media_source(url):
-        return False
-    # Domínio próprio / institucional: é elegível como evidência final.
-    return bool(source_domain(url))
+            return c, origin
+    return "", ""
 
 # ============================================================
-# SIGNAL VALIDATOR
-# ============================================================
-
-def has_negative_keywords(text):
-    low = str(text or "").lower()
-    negatives = [
-        "vaga de", "vagas para", "estamos contratando", "oportunidade de emprego",
-        "processo seletivo", "recrutamento", "salário", "salario", "carreira",
-        "curso de", "evento de", "webinar",
-    ]
-    return any(has_term(low, x) for x in negatives)
-
-def is_hiring_signal(text):
-    low = str(text or "").lower()
-    return any(has_term(low, x) for x in [
-        "vaga de", "vagas para", "estamos contratando", "contrata profissional",
-        "processo seletivo", "recrutamento",
-    ])
-
-def validate_buying_intent(evidence, source_type="NEWS", direct_source=False):
-    # Buying Intent só existe quando há comportamento de compra observável.
-    # Notícia, governo, licitação ou simples trigger jamais geram intent.
-    if not direct_source or source_type in ("NEWS", "DISCOVERY", "GOV"):
-        return "NONE"
-    if is_hiring_signal(evidence):
-        return "NONE"
-    strong = term_hits(evidence, INTENT_STRONG)
-    if strong:
-        return "HIGH"
-    context = term_hits(evidence, INTENT_CONTEXT)
-    technical = term_hits(evidence, TECH_TERMS)
-    if context and technical:
-        return "MEDIUM"
-    return "NONE"
-
-def classify_signal_type(text):
-    hits = {
-        "BUYING_INTENT": term_hits(text, INTENT_STRONG + INTENT_CONTEXT),
-        "NEED_SIGNAL": term_hits(text, TECH_TERMS),
-        "BUSINESS_TRIGGER": term_hits(text, TRIGGER_TERMS),
-        "PAIN_RISK": term_hits(text, PAIN_TERMS),
-        "DECISION_MAKER": term_hits(text, DM_TERMS),
-    }
-    return hits
-
-def extract_timeline(text):
-    low = str(text or "").lower()
-    if re.search(r"\b(?:2026|2027)\b", low):
-        return "MEDIUM"
-    if any(x in low for x in ["imediato", "urgente", "nos próximos dias", "nos proximos dias", "este mês", "este mes"]):
-        return "HIGH"
-    if any(x in low for x in ["próximos meses", "proximos meses", "planeja", "planeja contratar"]):
-        return "MEDIUM"
-    return "NONE"
-
-def extract_specificity_signals(text):
-    low = str(text or "").lower()
-    concrete = [
-        "rfp", "rfq", "edital", "pregão", "pregao", "cotação", "cotacao",
-        "orçamento", "orcamento", "fornecedor", "contratação", "contratacao",
-    ]
-    return [x for x in concrete if has_term(low, x)]
-
-def calculate_specificity_bonus(text):
-    n = len(extract_specificity_signals(text))
-    return min(5, n)
-
-def evidence_snippets(text, terms, max_snippets=3):
-    text = clean_text(text)
-    if not text:
-        return []
-    spans = []
-    for term in terms:
-        for m in re.finditer(term_pattern(term), text, flags=re.I):
-            start = max(0, m.start() - 180)
-            end = min(len(text), m.end() + 280)
-            spans.append(text[start:end].strip())
-            if len(spans) >= max_snippets:
-                return spans
-    return spans
-
-def filter_signals(signals):
-    out = []
-    for s in signals:
-        evidence = s.get("evidence", "")
-        kind = s.get("kind", "")
-        if kind == "BUYING_INTENT" and (is_hiring_signal(evidence) or has_negative_keywords(evidence)):
-            continue
-        out.append(s)
-    return out
-
-# ============================================================
-# BANCO
+# BANCO / MIGRAÇÃO
 # ============================================================
 
 def db():
@@ -561,131 +306,28 @@ def db():
     conn.execute("""CREATE TABLE IF NOT EXISTS companies(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT UNIQUE NOT NULL,
-        website TEXT DEFAULT '',
-        icp TEXT DEFAULT 'UNKNOWN',
-        created_at TEXT,
-        updated_at TEXT
-    )""")
+        website TEXT DEFAULT '', icp TEXT DEFAULT 'UNKNOWN',
+        created_at TEXT, updated_at TEXT)""")
     conn.execute("""CREATE TABLE IF NOT EXISTS sources(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        company_id INTEGER,
-        title TEXT,
-        url TEXT UNIQUE,
-        source_type TEXT,
-        publisher TEXT,
-        collected_at TEXT,
-        content TEXT,
-        published_at TEXT,
-        query TEXT
-    )""")
+        company_id INTEGER, title TEXT, url TEXT UNIQUE, source_type TEXT,
+        publisher TEXT, collected_at TEXT, content TEXT, published_at TEXT, query TEXT)""")
     conn.execute("""CREATE TABLE IF NOT EXISTS signals(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        company_id INTEGER,
-        source_id INTEGER,
-        kind TEXT,
-        evidence TEXT,
-        evidence_type TEXT,
-        confidence TEXT,
-        created_at TEXT,
-        UNIQUE(source_id,kind,evidence)
-    )""")
+        company_id INTEGER, source_id INTEGER, kind TEXT, evidence TEXT,
+        evidence_type TEXT, confidence TEXT, created_at TEXT,
+        UNIQUE(source_id,kind,evidence))""")
     conn.execute("""CREATE TABLE IF NOT EXISTS opportunities(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        company_id INTEGER UNIQUE,
-        trigger_text TEXT,
-        need TEXT,
-        pain TEXT,
-        intent TEXT,
-        dm TEXT,
-        timing TEXT,
-        score INTEGER,
-        confidence TEXT,
-        classification TEXT,
-        next_action TEXT,
-        reason TEXT,
-        created_at TEXT,
-        updated_at TEXT
-    )""")
+        company_id INTEGER UNIQUE, trigger_text TEXT, need TEXT, pain TEXT,
+        intent TEXT, dm TEXT, timing TEXT, score INTEGER, confidence TEXT,
+        classification TEXT, next_action TEXT, reason TEXT, created_at TEXT, updated_at TEXT)""")
     conn.execute("""CREATE TABLE IF NOT EXISTS hunts(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        started_at TEXT,
-        finished_at TEXT,
-        sources_found INTEGER DEFAULT 0,
-        signals_found INTEGER DEFAULT 0,
-        companies_found INTEGER DEFAULT 0,
-        new_opportunities INTEGER DEFAULT 0,
-        updated_opportunities INTEGER DEFAULT 0,
-        unassigned INTEGER DEFAULT 0,
-        discarded INTEGER DEFAULT 0
-    )""")
-    # --------------------------------------------------------
-    # MIGRAÇÃO COMPATÍVEL COM O hunter.db EXISTENTE
-    # CREATE TABLE IF NOT EXISTS não altera tabelas antigas.
-    # As versões anteriores do HUNTER podem ter criado a tabela
-    # hunts com menos colunas, causando OperationalError no INSERT.
-    # --------------------------------------------------------
-    migrations = {
-        "companies": {
-            "website": "TEXT DEFAULT ''",
-            "icp": "TEXT DEFAULT 'UNKNOWN'",
-            "created_at": "TEXT",
-            "updated_at": "TEXT",
-        },
-        "sources": {
-            "company_id": "INTEGER",
-            "title": "TEXT",
-            "url": "TEXT",
-            "source_type": "TEXT",
-            "publisher": "TEXT",
-            "collected_at": "TEXT",
-            "content": "TEXT",
-            "published_at": "TEXT",
-            "query": "TEXT",
-        },
-        "signals": {
-            "company_id": "INTEGER",
-            "source_id": "INTEGER",
-            "kind": "TEXT",
-            "evidence": "TEXT",
-            "evidence_type": "TEXT",
-            "confidence": "TEXT",
-            "created_at": "TEXT",
-        },
-        "opportunities": {
-            "company_id": "INTEGER",
-            "trigger_text": "TEXT",
-            "need": "TEXT",
-            "pain": "TEXT",
-            "intent": "TEXT",
-            "dm": "TEXT",
-            "timing": "TEXT",
-            "score": "INTEGER",
-            "confidence": "TEXT",
-            "classification": "TEXT",
-            "next_action": "TEXT",
-            "reason": "TEXT",
-            "created_at": "TEXT",
-            "updated_at": "TEXT",
-        },
-        "hunts": {
-            "started_at": "TEXT",
-            "finished_at": "TEXT",
-            "sources_found": "INTEGER DEFAULT 0",
-            "signals_found": "INTEGER DEFAULT 0",
-            "companies_found": "INTEGER DEFAULT 0",
-            "new_opportunities": "INTEGER DEFAULT 0",
-            "updated_opportunities": "INTEGER DEFAULT 0",
-            "unassigned": "INTEGER DEFAULT 0",
-            "discarded": "INTEGER DEFAULT 0",
-        },
-    }
-
-    for table, columns in migrations.items():
-        existing_cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
-        for column, definition in columns.items():
-            if column not in existing_cols:
-                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-
+        id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT, finished_at TEXT,
+        sources_found INTEGER DEFAULT 0, signals_found INTEGER DEFAULT 0,
+        companies_found INTEGER DEFAULT 0, new_opportunities INTEGER DEFAULT 0,
+        updated_opportunities INTEGER DEFAULT 0, unassigned INTEGER DEFAULT 0,
+        discarded INTEGER DEFAULT 0)""")
     conn.commit()
     return conn
 
@@ -693,10 +335,28 @@ def db():
 # COLETA
 # ============================================================
 
-def web_search(query, limit=10):
-    """Busca web aberta sem API paga. O resultado serve para descobrir páginas;
-    a evidência comercial só é aceita depois que a página final é acessada e validada.
-    """
+def rss_search(query):
+    q = f"{query} when:5d"
+    url = f"https://news.google.com/rss/search?q={quote_plus(q)}&hl=pt-BR&gl=BR&ceid=BR:pt-419"
+    rows = []
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.content, "xml")
+        for item in soup.find_all("item"):
+            title = clean_text(item.title.get_text(" ", strip=True) if item.title else "")
+            link = item.link.get_text(strip=True) if item.link else ""
+            desc = clean_text(item.description.get_text(" ", strip=True) if item.description else "")
+            pub = item.pubDate.get_text(strip=True) if item.pubDate else ""
+            publisher = item.source.get_text(strip=True) if item.source else ""
+            if title and link:
+                rows.append({"title": title, "url": link, "body": desc, "publisher": publisher,
+                             "source_type": "NEWS", "published_at": pub, "query": query})
+    except Exception:
+        pass
+    return rows
+
+def web_search(query, limit=8):
     rows = []
     try:
         url = f"https://www.bing.com/search?q={quote_plus(query)}&count={limit}&setlang=pt-BR"
@@ -710,613 +370,354 @@ def web_search(query, limit=10):
             href = a.get("href", "")
             title = clean_text(a.get_text(" ", strip=True))
             snippet = clean_text((li.select_one(".b_caption") or li).get_text(" ", strip=True))
-            if href.startswith("http") and title:
-                rows.append({
-                    "title": title, "url": href, "body": snippet,
-                    "publisher": source_domain(href), "source_type": "WEB",
-                    "published_at": "", "query": query,
-                })
+            if href.startswith("http") and title and not is_government_source(href):
+                rows.append({"title": title, "url": href, "body": snippet, "publisher": source_domain(href),
+                             "source_type": "WEB", "published_at": "", "query": query})
     except Exception:
         pass
     return rows
 
-
-def rss_search(query):
-    url = f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=pt-BR&gl=BR&ceid=BR:pt-419"
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.content, "xml")
-        rows = []
-        for item in soup.find_all("item"):
-            title = clean_text(item.title.get_text(" ", strip=True) if item.title else "")
-            link = item.link.get_text(strip=True) if item.link else ""
-            desc = clean_text(item.description.get_text(" ", strip=True) if item.description else "")
-            pub = item.pubDate.get_text(strip=True) if item.pubDate else ""
-            publisher = item.source.get_text(strip=True) if item.source else ""
-            if title and link:
-                rows.append({
-                    "title": title, "url": link, "body": desc,
-                    "publisher": publisher, "source_type": "NEWS",
-                    "published_at": pub, "query": query,
-                })
-        return rows
-    except Exception:
-        return []
-
-def pncp_search():
-    rows = []
-    base = "https://pncp.gov.br/api/consulta/v1/contratacoes/proposta"
-    now = datetime.utcnow()
-    final = (now + timedelta(days=30)).strftime("%Y-%m-%d")
-    for page in range(1, 7):
-        try:
-            params = {"dataFinal": final, "pagina": page, "tamanhoPagina": 100}
-            r = requests.get(base, params=params, headers=HEADERS, timeout=20)
-            if r.status_code != 200:
-                break
-            data = r.json()
-            items = data.get("data", [])
-            if not items:
-                break
-            for x in items:
-                org = x.get("orgaoEntidade", {}) or {}
-                company = org.get("razaoSocial") or org.get("nome") or ""
-                obj = x.get("objetoCompra") or x.get("objeto") or ""
-                link = x.get("linkSistemaOrigem") or x.get("numeroControlePNCP") or ""
-                if not link:
-                    link = "https://pncp.gov.br/app/editais"
-                rows.append({
-                    "title": clean_text(obj)[:250] or "Contratação pública",
-                    "url": link,
-                    "body": clean_text(obj),
-                    "publisher": "PNCP",
-                    "source_type": "PNCP",
-                    "published_at": "",
-                    "query": "PNCP propostas abertas",
-                    "company_candidate": clean_company(company),
-                })
-        except Exception:
-            break
-    return rows
-
 def fetch_page(url):
     try:
-        r = requests.get(url, headers=HEADERS, timeout=12)
+        r = requests.get(url, headers=HEADERS, timeout=12, allow_redirects=True)
         if r.status_code >= 400:
             return ""
         soup = BeautifulSoup(r.text, "html.parser")
         for tag in soup(["script", "style", "noscript", "svg"]):
             tag.decompose()
-        return clean_text(soup.get_text(" ", strip=True))[:12000]
+        return clean_text(soup.get_text(" ", strip=True))[:16000]
     except Exception:
         return ""
 
 # ============================================================
-# EMPRESAS / ICP
+# SIGNAL / QUALIFICATION
 # ============================================================
 
-def find_or_create_company(conn, name, now, diag=None):
-    name = clean_company(name)
-    if not validate_company_name(name):
-        if diag is not None:
-            diag["candidate_rejected"] += 1
-            diag["reject_invalid"] += 1
-        return None
+def hiring_only(text):
+    return any(has_term(text, x) for x in ["vaga de", "vagas para", "estamos contratando", "processo seletivo", "recrutamento"])
 
-    row = conn.execute("SELECT id,name FROM companies WHERE lower(name)=lower(?)", (name,)).fetchone()
-    if row:
-        return row["id"]
+def evidence_snippets(text, terms, limit=2):
+    text = clean_text(text)
+    spans = []
+    for term in terms:
+        for m in re.finditer(re.escape(term), text, flags=re.I):
+            spans.append(text[max(0, m.start()-180):min(len(text), m.end()+320)].strip())
+            if len(spans) >= limit:
+                return spans
+    return spans
 
-    conn.execute(
-        "INSERT INTO companies(name,website,icp,created_at,updated_at) VALUES(?,?,?,?,?)",
-        (name, "", "UNKNOWN", now, now),
-    )
-    conn.commit()
-    return conn.execute("SELECT id FROM companies WHERE name=?", (name,)).fetchone()["id"]
+def validate_intent(text, source_type):
+    # Intenção de compra exige evidência comercial explícita.
+    if hiring_only(text):
+        return "NONE"
+    if term_hits(text, INTENT_STRONG):
+        return "HIGH"
+    return "NONE"
 
-def infer_icp(company_name, signals):
-    text = " ".join(s["evidence"] for s in signals).lower()
-    # Não marcar ICP OUT apenas por uma palavra. A regra precisa de evidência.
-    out_terms = ["escola", "universidade", "igreja", "hospital público", "prefeitura"]
-    if any(has_term(text, x) for x in out_terms):
+def classify_entity(company, evidence):
+    if not company:
         return "UNKNOWN"
+    if is_government_entity(company, evidence):
+        return "GOVERNMENT"
+    return "PRIVATE"
 
-    tech = len(term_hits(text, TECH_TERMS))
-    intent = len(term_hits(text, INTENT_STRONG))
-    if tech >= 2 and intent >= 1:
-        return "LIKELY"
-    if tech >= 3:
+def infer_icp(company, evidence):
+    # ICP mínimo para este Hunter: empresa privada B2B com ambiente tecnológico
+    # relevante. Não fingimos conhecer a quantidade de endpoints quando a fonte não informa.
+    entity = classify_entity(company, evidence)
+    if entity != "PRIVATE":
+        return "CLEARLY_OUT"
+    tech = len(set(term_hits(evidence, TECH_TERMS)))
+    complexity = len(set(term_hits(evidence, ["infraestrutura", "cloud", "nuvem", "data center", "sistemas", "rede", "endpoints", "servidores", "unidades"])))
+    if tech >= 2 and complexity >= 1:
         return "LIKELY"
     return "UNKNOWN"
 
-def independent_counts(signals):
-    by = {}
-    for kind in ["BUYING_INTENT", "NEED_SIGNAL", "PAIN_RISK", "BUSINESS_TRIGGER", "DECISION_MAKER"]:
-        subset = [s for s in signals if s["kind"] == kind]
-        sources = {s["source_id"] for s in subset if s["source_id"] is not None}
-        by[kind] = {"rows": len(subset), "sources": len(sources), "items": subset}
-    return by
+def classify_company(company, signals, source_rows):
+    evidence = " ".join(s["evidence"] for s in signals)
+    entity = classify_entity(company, evidence)
+    if entity != "PRIVATE":
+        return {"icp":"CLEARLY_OUT", "intent":"NONE", "need":"NONE", "pain":"NONE", "trigger":"NONE", "dm":"NONE", "timing":"NONE", "score":0, "confidence":"HIGH", "classification":"IGNORE", "reason":"Entidade pública/não privada."}
 
-def classify_company(company_name, signals):
-    by = independent_counts(signals)
-    all_text = " ".join(s["evidence"] for s in signals)
+    # Só consideramos evidência recente na qualificação.
+    recent_sources = []
+    for src in source_rows:
+        freshness_class, days = freshness(src.get("published_at"), src.get("title",""), src.get("content",""))
+        if freshness_class in ("HOT", "WARM"):
+            recent_sources.append((src, freshness_class, days))
 
-    intent_sources = by["BUYING_INTENT"]["sources"]
-    need_sources = by["NEED_SIGNAL"]["sources"]
-    pain_sources = by["PAIN_RISK"]["sources"]
-    trigger_sources = by["BUSINESS_TRIGGER"]["sources"]
-    dm_sources = by["DECISION_MAKER"]["sources"]
+    if not recent_sources:
+        return {"icp":"UNKNOWN", "intent":"NONE", "need":"NONE", "pain":"NONE", "trigger":"NONE", "dm":"NONE", "timing":"STALE", "score":0, "confidence":"HIGH", "classification":"WATCH", "reason":"Sem fonte comprovadamente recente (≤5 dias)."}
 
-    # Intent: exige evidência independente. PNCP já chega como HIGH.
-    if any(s["confidence"] == "HIGH" and s["kind"] == "BUYING_INTENT" for s in signals):
-        intent = "HIGH"
-    elif intent_sources >= 2:
-        intent = "HIGH"
-    elif intent_sources == 1:
-        intent = "MEDIUM"
-    else:
-        intent = "NONE"
+    # Intent só conta quando existe fonte direta não-mídia.
+    intent_direct = False
+    intent_high = False
+    for src, _, _ in recent_sources:
+        if not is_media(src.get("url","")) and validate_intent(src.get("content",""), src.get("source_type","")) == "HIGH":
+            intent_direct = True
+            intent_high = True
+            break
 
-    if need_sources >= 2:
-        need = "HIGH"
-    elif need_sources == 1:
-        need = "MEDIUM"
-    else:
-        need = "NONE"
+    need = "HIGH" if len({s["source_id"] for s in signals if s["kind"]=="NEED_SIGNAL" and s["source_id"]}) >= 2 else ("MEDIUM" if any(s["kind"]=="NEED_SIGNAL" for s in signals) else "NONE")
+    pain = "HIGH" if len({s["source_id"] for s in signals if s["kind"]=="PAIN_RISK" and s["source_id"]}) >= 2 else ("MEDIUM" if any(s["kind"]=="PAIN_RISK" for s in signals) else "NONE")
+    trigger = "MEDIUM" if any(s["kind"]=="BUSINESS_TRIGGER" for s in signals) else "NONE"
+    dm = "LIKELY" if any(s["kind"]=="DECISION_MAKER" for s in signals) else "NONE"
 
-    if pain_sources >= 2:
-        pain = "HIGH"
-    elif pain_sources == 1:
-        pain = "MEDIUM"
-    else:
-        pain = "NONE"
+    icp = infer_icp(company, evidence)
+    intent = "HIGH" if intent_high else "NONE"
+    hot = any(x[1] == "HOT" for x in recent_sources)
+    timing = "HIGH" if hot else "MEDIUM"
 
-    if trigger_sources >= 2:
-        trigger = "HIGH"
-    elif trigger_sources == 1:
-        trigger = "MEDIUM"
-    else:
-        trigger = "NONE"
-
-    dm = "LIKELY" if dm_sources >= 1 else "NONE"
-    timing = extract_timeline(all_text)
-
-    # ICP é gate. UNKNOWN não pode virar HOT.
-    icp = infer_icp(company_name, signals)
-
+    # Score é consequência dos gates, não o contrário.
     score = 0
-    score += {"NONE": 0, "UNKNOWN": 7, "LIKELY": 12, "CLEAR": 15}.get(icp, 7)
-    score += {"NONE": 0, "MEDIUM": 15, "HIGH": 25, "VERY HIGH": 25}.get(intent, 0)
-    score += {"NONE": 0, "MEDIUM": 10, "HIGH": 20}.get(need, 0)
-    score += {"NONE": 0, "MEDIUM": 10, "HIGH": 20}.get(pain, 0)
-    score += {"NONE": 0, "MEDIUM": 5, "HIGH": 10}.get(timing, 0)
-    score += 7 if dm == "LIKELY" else 0
-    score += calculate_specificity_bonus(all_text)
+    score += 15 if icp == "LIKELY" else 0
+    score += 25 if intent == "HIGH" else 0
+    score += 20 if need == "HIGH" else (10 if need == "MEDIUM" else 0)
+    score += 20 if pain == "HIGH" else (10 if pain == "MEDIUM" else 0)
+    score += 10 if timing == "HIGH" else 5
+    score += 5 if dm == "LIKELY" else 0
+    score = min(score, 100)
 
-    caps = {"NONE": 30, "MEDIUM": 75, "HIGH": 90, "VERY HIGH": 100}
-    score = min(score, caps.get(intent, 30))
-
-    # GATE de ICP:
-    if icp == "UNKNOWN":
-        score = min(score, 55)
-    if icp == "OUT":
-        return {
-            "icp": icp, "intent": intent, "need": need, "pain": pain,
-            "trigger": trigger, "dm": dm, "timing": timing,
-            "score": 0, "confidence": "LOW", "classification": "IGNORE"
-        }
-
-    # GATE COMERCIAL: oportunidade real exige ICP + Buying Intent + demanda/dor.
-    # Trigger isolado, notícia, contratação de pessoa ou tecnologia genérica = WATCH.
-    if icp == "UNKNOWN":
-        classification = "WATCH" if any(x != "NONE" for x in [intent, need, pain, trigger]) else "IGNORE"
-    elif intent == "HIGH" and need in ("MEDIUM", "HIGH") and pain in ("MEDIUM", "HIGH") and score >= 80:
-        classification = "HOT"
-    elif intent == "HIGH" and need in ("MEDIUM", "HIGH") and (pain != "NONE") and score >= 60:
-        classification = "WARM"
-    elif intent == "MEDIUM" and need in ("MEDIUM", "HIGH"):
-        classification = "WATCH"
-    elif pain != "NONE" or trigger != "NONE" or need != "NONE":
+    # GATE DEFINITIVO: não existe WARM/HOT sem intenção comercial explícita.
+    if icp == "LIKELY" and intent == "HIGH" and need in ("MEDIUM","HIGH") and pain in ("MEDIUM","HIGH"):
+        classification = "HOT" if hot and score >= 80 else "WARM"
+    elif pain != "NONE" or need != "NONE" or trigger != "NONE":
         classification = "WATCH"
     else:
         classification = "IGNORE"
 
-    confidence = "HIGH" if intent in ("HIGH", "VERY HIGH") and need != "NONE" else ("MEDIUM" if any(x != "NONE" for x in [intent, need, pain]) else "LOW")
+    confidence = "HIGH" if intent == "HIGH" and need != "NONE" and pain != "NONE" else ("MEDIUM" if any(x != "NONE" for x in [need,pain,trigger]) else "LOW")
+    return {"icp":icp,"intent":intent,"need":need,"pain":pain,"trigger":trigger,"dm":dm,"timing":timing,"score":score,"confidence":confidence,"classification":classification,
+            "reason":f"Entity={entity} | ICP={icp} | Intent={intent} | Need={need} | Pain={pain} | Timing={timing} | DirectIntent={intent_direct}"}
 
+def classify_signal_type(text):
     return {
-        "icp": icp, "intent": intent, "need": need, "pain": pain,
-        "trigger": trigger, "dm": dm, "timing": timing,
-        "score": int(score), "confidence": confidence, "classification": classification
+        "BUYING_INTENT": term_hits(text, INTENT_STRONG),
+        "NEED_SIGNAL": term_hits(text, TECH_TERMS),
+        "BUSINESS_TRIGGER": term_hits(text, TRIGGER_TERMS),
+        "PAIN_RISK": term_hits(text, PAIN_TERMS),
+        "DECISION_MAKER": term_hits(text, DM_TERMS),
     }
-
-# ============================================================
-# HUNTER
-# ============================================================
-
-def qualify_hunter(conn):
-    companies = conn.execute("SELECT * FROM companies ORDER BY id").fetchall()
-    stats = {"new": 0, "updated": 0}
-
-    for c in companies:
-        rows = conn.execute("""
-            SELECT s.*, src.title, src.url, src.source_type
-            FROM signals s
-            LEFT JOIN sources src ON src.id=s.source_id
-            WHERE s.company_id=?
-        """, (c["id"],)).fetchall()
-
-        signals = [dict(r) for r in rows]
-        if not signals:
-            continue
-
-        result = classify_company(c["name"], signals)
-        now = datetime.utcnow().isoformat(timespec="seconds")
-
-        reason = (
-            f"ICP={result['icp']} | Intent={result['intent']} | Need={result['need']} | "
-            f"Pain={result['pain']} | Trigger={result['trigger']} | Timing={result['timing']} | "
-            f"DM={result['dm']} | Score={result['score']}"
-        )
-        next_action = {
-            "HOT": "Abordagem comercial imediata com validação de dor e decisão.",
-            "WARM": "Abordagem consultiva e confirmação de necessidade.",
-            "WATCH": "Monitorar novas evidências e buscar confirmação de dor/intent.",
-            "IGNORE": "Sem ação comercial neste momento.",
-        }[result["classification"]]
-
-        exists = conn.execute("SELECT id FROM opportunities WHERE company_id=?", (c["id"],)).fetchone()
-        vals = (
-            next((s["evidence"] for s in signals if s["kind"] == "BUSINESS_TRIGGER"), ""),
-            next((s["evidence"] for s in signals if s["kind"] == "NEED_SIGNAL"), ""),
-            next((s["evidence"] for s in signals if s["kind"] == "PAIN_RISK"), ""),
-            result["intent"],
-            next((s["evidence"] for s in signals if s["kind"] == "DECISION_MAKER"), ""),
-            result["timing"], result["score"], result["confidence"],
-            result["classification"], next_action, reason, now
-        )
-
-        if exists:
-            conn.execute("""UPDATE opportunities SET trigger_text=?,need=?,pain=?,intent=?,dm=?,timing=?,
-                score=?,confidence=?,classification=?,next_action=?,reason=?,updated_at=? WHERE company_id=?""",
-                vals + (c["id"],))
-            stats["updated"] += 1
-        else:
-            conn.execute("""INSERT INTO opportunities(company_id,trigger_text,need,pain,intent,dm,timing,
-                score,confidence,classification,next_action,reason,created_at,updated_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (c["id"],) + vals + (now,))
-            stats["new"] += 1
-
-        conn.execute("UPDATE companies SET icp=?,updated_at=? WHERE id=?", (result["icp"], now, c["id"]))
-
-    conn.commit()
-    return stats
 
 # ============================================================
 # CAÇA
 # ============================================================
 
-def reprocess_unassigned_sources(conn, diag, limit=1000):
-    """Reexecuta somente a resolução de entidade sobre fontes já coletadas.
-
-    Isso permite corrigir as 616/637 evidências antigas sem depender de uma nova coleta.
-    """
-    rows = conn.execute("""
-        SELECT id,company_id,title,url,source_type,publisher,content
-        FROM sources
-        WHERE company_id IS NULL
-        ORDER BY id DESC
-        LIMIT ?
-    """, (limit,)).fetchall()
-    if not rows:
-        return 0, 0
-
-    existing = [r["name"] for r in conn.execute("SELECT name FROM companies ORDER BY id").fetchall()]
-    resolved = 0
-    for row in rows:
-        diag["reprocessed"] += 1
-        if not is_direct_b2b_source(row["url"] or "", row["title"] or "", row["content"] or ""):
-            continue
-        name, origin, _ = resolve_company(
-            row["title"] or "", row["content"] or "", row["publisher"] or "",
-            row["url"] or "", "", existing, diag
-        )
-        if not name:
-            continue
-        company_id = find_or_create_company(conn, name, datetime.utcnow().isoformat(timespec="seconds"), diag)
-        if not company_id:
-            continue
-        conn.execute("UPDATE sources SET company_id=? WHERE id=?", (company_id, row["id"]))
-        conn.execute("UPDATE signals SET company_id=? WHERE source_id=? AND company_id IS NULL", (company_id, row["id"]))
-        if name not in existing:
-            existing.append(name)
-        resolved += 1
-        diag["reprocessed_resolved"] += 1
+def find_or_create_company(conn, name, now):
+    name = clean_company(name)
+    if not valid_company(name):
+        return None
+    row = conn.execute("SELECT id FROM companies WHERE lower(name)=lower(?)", (name,)).fetchone()
+    if row:
+        return row["id"]
+    conn.execute("INSERT INTO companies(name,website,icp,created_at,updated_at) VALUES(?,?,?,?,?)", (name,"","UNKNOWN",now,now))
     conn.commit()
-    return len(rows), resolved
+    return conn.execute("SELECT id FROM companies WHERE name=?", (name,)).fetchone()["id"]
+
+def save_source(conn, item, company_id, content):
+    row = conn.execute("SELECT id FROM sources WHERE url=?", (item["url"],)).fetchone()
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    if row:
+        sid = row["id"]
+        conn.execute("UPDATE sources SET company_id=COALESCE(company_id,?),title=?,publisher=?,content=?,published_at=?,query=? WHERE id=?", (company_id,item["title"],item.get("publisher",""),content[:16000],item.get("published_at",""),item.get("query",""),sid))
+    else:
+        cur = conn.execute("""INSERT INTO sources(company_id,title,url,source_type,publisher,collected_at,content,published_at,query) VALUES(?,?,?,?,?,?,?,?,?)""", (company_id,item["title"],item["url"],item.get("source_type","NEWS"),item.get("publisher",""),now,content[:16000],item.get("published_at",""),item.get("query","")))
+        sid = cur.lastrowid
+    conn.commit()
+    return sid
+
+def save_signals(conn, company_id, source_id, evidence_text):
+    generated = []
+    intent = validate_intent(evidence_text, "")
+    # Intent só nasce de fonte direta; caller já garante isso.
+    if intent == "HIGH":
+        for ev in evidence_snippets(evidence_text, INTENT_STRONG, 2):
+            generated.append(("BUYING_INTENT", ev, "HIGH"))
+    for kind, terms in [("NEED_SIGNAL",TECH_TERMS),("BUSINESS_TRIGGER",TRIGGER_TERMS),("PAIN_RISK",PAIN_TERMS),("DECISION_MAKER",DM_TERMS)]:
+        for ev in evidence_snippets(evidence_text, terms, 2):
+            generated.append((kind, ev, "MEDIUM"))
+    count = 0
+    for kind, ev, conf in generated:
+        conn.execute("INSERT OR IGNORE INTO signals(company_id,source_id,kind,evidence,evidence_type,confidence,created_at) VALUES(?,?,?,?,?,?,?)", (company_id,source_id,kind,ev,"FACT",conf,datetime.utcnow().isoformat(timespec="seconds")))
+        if conn.execute("SELECT changes()").fetchone()[0]: count += 1
+    conn.commit()
+    return count
+
+def requalify_all(conn):
+    stats = {"hot":0,"warm":0,"watch":0,"ignore":0}
+    companies = conn.execute("SELECT * FROM companies").fetchall()
+    for c in companies:
+        src_rows = [dict(r) for r in conn.execute("SELECT * FROM sources WHERE company_id=?", (c["id"],)).fetchall()]
+        sig_rows = [dict(r) for r in conn.execute("SELECT * FROM signals WHERE company_id=?", (c["id"],)).fetchall()]
+        if not sig_rows:
+            continue
+        result = classify_company(c["name"], sig_rows, src_rows)
+        now = datetime.utcnow().isoformat(timespec="seconds")
+        reason = result["reason"]
+        next_action = {"HOT":"Abordar imediatamente e validar dor/decisor.","WARM":"Abordar consultivamente e validar projeto.","WATCH":"Monitorar e buscar evidência comercial.","IGNORE":"Sem ação comercial."}[result["classification"]]
+        vals = (next((s["evidence"] for s in sig_rows if s["kind"]=="BUSINESS_TRIGGER"),""), next((s["evidence"] for s in sig_rows if s["kind"]=="NEED_SIGNAL"),""), next((s["evidence"] for s in sig_rows if s["kind"]=="PAIN_RISK"),""), result["intent"], next((s["evidence"] for s in sig_rows if s["kind"]=="DECISION_MAKER"),""), result["timing"], result["score"], result["confidence"], result["classification"], next_action, reason, now, c["id"])
+        exists = conn.execute("SELECT id FROM opportunities WHERE company_id=?", (c["id"],)).fetchone()
+        if exists:
+            conn.execute("UPDATE opportunities SET trigger_text=?,need=?,pain=?,intent=?,dm=?,timing=?,score=?,confidence=?,classification=?,next_action=?,reason=?,updated_at=? WHERE company_id=?", vals)
+        else:
+            conn.execute("INSERT INTO opportunities(company_id,trigger_text,need,pain,intent,dm,timing,score,confidence,classification,next_action,reason,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (c["id"],)+vals[:-1]+(now,))
+        conn.execute("UPDATE companies SET icp=?,updated_at=? WHERE id=?", (result["icp"],now,c["id"]))
+        stats[result["classification"].lower()] = stats.get(result["classification"].lower(),0)+1
+    conn.commit()
+    return stats
 
 def run_hunt():
-    conn = db()
-    started = datetime.utcnow().isoformat(timespec="seconds")
-    diag = empty_diag()
+    conn = db(); started = datetime.utcnow().isoformat(timespec="seconds")
+    collected=[]; seen=set(); diag={"rss":0,"web":0,"stale":0,"gov":0,"media":0,"companies":0,"signals":0,"intent":0}
+    progress=st.progress(0,text="MILO: procurando fontes quentes (0–5 dias)...")
 
-    # Primeiro recupera o estoque já coletado e ainda sem empresa.
-    # Isso evita que a evolução do resolver exija nova coleta para surtir efeito.
-    reprocess_unassigned_sources(conn, diag, limit=1500)
-
-    collected = []
-    seen = set()
-
-    progress = st.progress(0, text="MILO coletando fontes...")
-    total_q = len(SEARCH_QUERIES)
-
-    for i, q in enumerate(SEARCH_QUERIES):
+    # RSS: ampla descoberta recente.
+    for i,q in enumerate(SEARCH_QUERIES):
         for item in rss_search(q):
-            key = item["url"]
-            if key not in seen:
-                seen.add(key)
-                collected.append(item)
-        progress.progress(int((i + 1) / total_q * 60), text=f"MILO: consulta {i+1}/{total_q}")
+            if item["url"] not in seen:
+                seen.add(item["url"]); collected.append(item); diag["rss"]+=1
+        progress.progress(int((i+1)/len(SEARCH_QUERIES)*55), text=f"MILO RSS {i+1}/{len(SEARCH_QUERIES)}")
 
-    # PNCP/GOV/LICITAÇÃO foram retirados da caça comercial.
-    # O Hunter é B2B privado: não transforma compras públicas em oportunidade TECHS.
-    collected = [
-        item for item in collected
-        if not is_excluded_source(item.get("url", ""), item.get("title", "") + " " + item.get("body", ""))
-    ]
+    # WEB: só as consultas mais comerciais; recência via Bing after:.
+    cutoff=(datetime.now(timezone.utc)-timedelta(days=MAX_DAYS)).date().isoformat()
+    web_queries=SEARCH_QUERIES[:18]
+    for j,q in enumerate(web_queries):
+        q2=f"{q} after:{cutoff}"
+        for item in web_search(q2,8):
+            if item["url"] not in seen:
+                seen.add(item["url"]); collected.append(item); diag["web"]+=1
+        progress.progress(55+int((j+1)/len(web_queries)*25), text=f"MILO WEB {j+1}/{len(web_queries)}")
 
-    diag["sources"] = len(collected)
-
-    existing = [r["name"] for r in conn.execute("SELECT name FROM companies").fetchall()]
-    signals_new = 0
-    companies_touched = set()
-    unassigned = 0
-
-    # Limite inicial para não transformar o Cloud em centenas de requests sequenciais.
-    candidates = []
+    # Primeiro filtro: GOV nunca entra na caça comercial.
+    filtered=[]
     for item in collected:
-        text = f"{item.get('title','')} {item.get('body','')}"
-        # Notícias são apenas descoberta e não entram no funil comercial.
-        # Processamos somente URLs que possam representar evidência B2B direta.
-        if is_direct_b2b_source(item.get("url", ""), item.get("title", ""), item.get("body", "")) and term_hits(text, INTENT_STRONG + TECH_TERMS + TRIGGER_TERMS + PAIN_TERMS):
+        txt=item["title"]+" "+item.get("body","")
+        if is_government_source(item["url"]): diag["gov"]+=1; continue
+        if is_government_entity("",txt) and len(term_hits(txt,GOV_TERMS))>=2: diag["gov"]+=1; continue
+        fc,_=freshness(item.get("published_at"),item.get("title"),item.get("body"))
+        if fc in ("STALE", "UNKNOWN"):
+            diag["stale"]+=1; continue
+        filtered.append(item)
+    collected=filtered
+
+    # Processa somente fontes que têm relação com dor/necessidade/compra.
+    candidates=[]
+    for item in collected:
+        txt=item["title"]+" "+item.get("body","")
+        if term_hits(txt, INTENT_STRONG+TECH_TERMS+PAIN_TERMS+TRIGGER_TERMS):
             candidates.append(item)
+    candidates=candidates[:300]
 
-    max_candidates = min(len(candidates), 250)
-    progress = st.progress(60, text=f"Processando {max_candidates} fontes candidatas...")
+    progress.progress(80,text=f"HUNTER: validando {len(candidates)} fontes quentes...")
+    conn=db(); existing=[r["name"] for r in conn.execute("SELECT name FROM companies").fetchall()]
+    touched=set(); signals_new=0
 
-    for idx, item in enumerate(candidates[:max_candidates]):
-        title = clean_text(item.get("title", ""))
-        url = item.get("url", "")
-        body = clean_text(item.get("body", ""))
-        source_type = item.get("source_type", "NEWS")
-        publisher = item.get("publisher", "")
-        explicit = item.get("company_candidate", "")
-
-        # Enriquecimento somente quando necessário.
-        full_body = fetch_page(url) if len(body) < 700 else body
-        evidence_text = f"{title}. {full_body or body}"
-
-        name, origin, resolve_reason = resolve_company(
-            title, evidence_text, publisher, url, explicit, existing, diag
-        )
-
-        company_id = None
-        if name:
-            company_id = find_or_create_company(conn, name, datetime.utcnow().isoformat(timespec="seconds"), diag)
-            if company_id:
-                companies_touched.add(company_id)
-                if name not in existing:
-                    existing.append(name)
-
-        # Fonte é armazenada mesmo sem empresa: MILO não perde evidência.
-        try:
-            now_iso = datetime.utcnow().isoformat(timespec="seconds")
-            existing_source = conn.execute("SELECT id,company_id FROM sources WHERE url=?", (url,)).fetchone()
-            if existing_source:
-                source_id = existing_source["id"]
-                # Corrige registros antigos que foram armazenados sem empresa.
-                if company_id and not existing_source["company_id"]:
-                    conn.execute("UPDATE sources SET company_id=?,title=?,publisher=?,content=?,published_at=?,query=? WHERE id=?",
-                                 (company_id, title, publisher, evidence_text[:12000], item.get("published_at",""), item.get("query",""), source_id))
-                    conn.execute("UPDATE signals SET company_id=? WHERE source_id=? AND company_id IS NULL",
-                                 (company_id, source_id))
-                else:
-                    conn.execute("UPDATE sources SET content=?,title=?,publisher=? WHERE id=?",
-                                 (evidence_text[:12000], title, publisher, source_id))
-            else:
-                cur = conn.execute("""INSERT INTO sources
-                    (company_id,title,url,source_type,publisher,collected_at,content,published_at,query)
-                    VALUES(?,?,?,?,?,?,?,?,?)""",
-                    (company_id, title, url, source_type, publisher, now_iso,
-                     evidence_text[:12000], item.get("published_at",""), item.get("query","")))
-                source_id = cur.lastrowid
-            conn.commit()
-        except Exception:
-            source_id = None
-
-        # Sinais do MILO.
-        kinds = classify_signal_type(evidence_text)
-        generated = []
-
-        direct_source = is_direct_b2b_source(url, title, evidence_text)
-        if not direct_source:
-            # Descoberta sem valor comercial final: fonte é preservada, mas não gera sinal.
+    for i,item in enumerate(candidates):
+        title=clean_text(item["title"]); url=item["url"]; body=clean_text(item.get("body",""))
+        # Busca página completa para obter contexto e descobrir entidade.
+        page=fetch_page(url) if len(body)<1000 or item.get("source_type")=="WEB" else body
+        content=clean_text(f"{title}. {page or body}")
+        if is_government_source(url) or is_government_entity("",title+" "+content):
             continue
-        intent_conf = validate_buying_intent(evidence_text, source_type, direct_source=direct_source)
-        if intent_conf != "NONE":
-            for ev in evidence_snippets(evidence_text, INTENT_STRONG + INTENT_CONTEXT, 2):
-                generated.append(("BUYING_INTENT", ev, intent_conf))
 
-        for kind, terms in [
-            ("NEED_SIGNAL", TECH_TERMS),
-            ("BUSINESS_TRIGGER", TRIGGER_TERMS),
-            ("PAIN_RISK", PAIN_TERMS),
-            ("DECISION_MAKER", DM_TERMS),
-        ]:
-            for ev in evidence_snippets(evidence_text, terms, 2):
-                generated.append((kind, ev, "MEDIUM"))
+        name,origin=resolve_company(title,content,url,existing)
+        if not name:
+            continue
+        if is_government_entity(name,title+" "+content):
+            continue
+        cid=find_or_create_company(conn,name,datetime.utcnow().isoformat(timespec="seconds"))
+        if not cid: continue
+        if name not in existing: existing.append(name)
+        touched.add(cid)
+        sid=save_source(conn,item,cid,content)
 
-        generated = filter_signals([
-            {"kind": k, "evidence": e, "confidence": c}
-            for k, e, c in generated
-        ])
+        # Fonte direta pode gerar intent. Notícia não pode.
+        direct=not is_media(url)
+        if direct:
+            n=save_signals(conn,cid,sid,content); signals_new+=n; diag["signals"]+=n
+            if validate_intent(content,item.get("source_type",""))=="HIGH": diag["intent"]+=1
+        else:
+            # Notícia: somente dor/trigger/need como evidência de contexto.
+            generated=[]
+            for kind,terms in [("NEED_SIGNAL",TECH_TERMS),("BUSINESS_TRIGGER",TRIGGER_TERMS),("PAIN_RISK",PAIN_TERMS)]:
+                for ev in evidence_snippets(content,terms,2): generated.append((kind,ev,"MEDIUM"))
+            for kind,ev,conf in generated:
+                conn.execute("INSERT OR IGNORE INTO signals(company_id,source_id,kind,evidence,evidence_type,confidence,created_at) VALUES(?,?,?,?,?,?,?)",(cid,sid,kind,ev,"FACT",conf,datetime.utcnow().isoformat(timespec="seconds")))
+                if conn.execute("SELECT changes()").fetchone()[0]: signals_new+=1; diag["signals"]+=1
+            conn.commit()
 
-        for s in generated:
-            try:
-                conn.execute("""INSERT OR IGNORE INTO signals
-                    (company_id,source_id,kind,evidence,evidence_type,confidence,created_at)
-                    VALUES(?,?,?,?,?,?,?)""",
-                    (company_id, source_id, s["kind"], s["evidence"], "FACT", s["confidence"],
-                     datetime.utcnow().isoformat(timespec="seconds")))
-                if conn.execute("SELECT changes()").fetchone()[0] > 0:
-                    signals_new += 1
-                    if company_id:
-                        diag["signals_with_company"] += 1
-                    else:
-                        diag["signals_without_company"] += 1
-            except Exception:
-                pass
-
-        diag["signals_total"] += len(generated)
-        if not company_id and generated:
-            unassigned += len(generated)
-
-        if idx % 10 == 0:
-            progress.progress(60 + int((idx + 1) / max(1, max_candidates) * 40),
-                              text=f"Processando {idx+1}/{max_candidates}...")
+        if i%10==0: progress.progress(80+int((i+1)/max(1,len(candidates))*20),text=f"HUNTER: {i+1}/{len(candidates)}")
 
     progress.empty()
-
-    stats = qualify_hunter(conn)
-
-    finished = datetime.utcnow().isoformat(timespec="seconds")
-    conn.execute("""INSERT INTO hunts
-        (started_at,finished_at,sources_found,signals_found,companies_found,new_opportunities,
-         updated_opportunities,unassigned,discarded)
-        VALUES(?,?,?,?,?,?,?,?,?)""",
-        (started, finished, len(collected), signals_new, len(companies_touched),
-         stats["new"], stats["updated"], unassigned, 0))
+    stats=requalify_all(conn)
+    finished=datetime.utcnow().isoformat(timespec="seconds")
+    conn.execute("INSERT INTO hunts(started_at,finished_at,sources_found,signals_found,companies_found,new_opportunities,updated_opportunities,unassigned,discarded) VALUES(?,?,?,?,?,?,?,?,?)",(started,finished,len(collected),signals_new,len(touched),stats.get("hot",0)+stats.get("warm",0),0,0,diag["gov"]+diag["stale"]))
     conn.commit()
-
-    return diag, len(collected), signals_new, len(companies_touched), stats, unassigned
+    return diag,len(collected),signals_new,len(touched),stats
 
 # ============================================================
 # UI
 # ============================================================
-
-conn = db()
+conn=db()
+companies_count=conn.execute("SELECT COUNT(*) c FROM companies").fetchone()["c"]
+signals_count=conn.execute("SELECT COUNT(*) c FROM signals").fetchone()["c"]
+hot_count=conn.execute("SELECT COUNT(*) c FROM opportunities WHERE classification='HOT'").fetchone()["c"]
+warm_count=conn.execute("SELECT COUNT(*) c FROM opportunities WHERE classification='WARM'").fetchone()["c"]
+watch_count=conn.execute("SELECT COUNT(*) c FROM opportunities WHERE classification='WATCH'").fetchone()["c"]
 
 st.title("🔎 HUNTER TECHS")
-st.caption("MILO → evidência pública → resolução de entidade → HUNTER → qualificação comercial")
+st.caption("V12 • HOT SOURCE HUNTER — empresas privadas • 0–3 dias prioritário • até 5 dias • dor TECHS + evidência comercial")
+cols=st.columns(5)
+cols[0].metric("Empresas",companies_count)
+cols[1].metric("Sinais",signals_count)
+cols[2].metric("Oportunidades",hot_count+warm_count)
+cols[3].metric("HOT",hot_count)
+cols[4].metric("WARM",warm_count)
+st.caption(f"WATCH: {watch_count} • WATCH não é oportunidade • GOV/licitação não participa da caça")
 
-cols = st.columns(5)
-companies_count = conn.execute("SELECT COUNT(*) c FROM companies").fetchone()["c"]
-signals_count = conn.execute("SELECT COUNT(*) c FROM signals").fetchone()["c"]
-opp_count = conn.execute("SELECT COUNT(*) c FROM opportunities WHERE classification IN ('HOT','WARM')").fetchone()["c"]
-hot_count = conn.execute("SELECT COUNT(*) c FROM opportunities WHERE classification='HOT'").fetchone()["c"]
-warm_count = conn.execute("SELECT COUNT(*) c FROM opportunities WHERE classification='WARM'").fetchone()["c"]
+if st.button("🚀 IR PARA CAÇA REAL",type="primary",use_container_width=True):
+    with st.spinner("Caçando empresas privadas com dor recente..."):
+        diag,sources,sigs,comps,stats=run_hunt()
+    st.success(f"Caça concluída — {sources} fontes recentes | {sigs} sinais novos | {comps} empresas | HOT {stats.get('hot',0)} | WARM {stats.get('warm',0)} | WATCH {stats.get('watch',0)}")
+    st.write("**Diagnóstico da caça**")
+    st.dataframe(pd.DataFrame([diag]),use_container_width=True,hide_index=True)
 
-cols[0].metric("Empresas", companies_count)
-cols[1].metric("Sinais", signals_count)
-cols[2].metric("Oportunidades", opp_count)
-cols[3].metric("HOT", hot_count)
-cols[4].metric("WARM", warm_count)
-watch_count = conn.execute("SELECT COUNT(*) c FROM opportunities WHERE classification='WATCH'").fetchone()["c"]
-st.caption(f"WATCH / monitoramento: {watch_count} | Oportunidade comercial: somente HOT + WARM")
+# TESTE DE REGRESSÃO — o caso que derrubou versões anteriores.
+st.subheader("🧪 Teste de integridade comercial")
+test = {
+    "TCU + contratação de nuvem do governo": "IGNORE",
+    "Licitação / pregão / edital": "IGNORE",
+    "Notícia de ransomware sem compra": "WATCH",
+    "Trigger sem intenção": "WATCH",
+    "Intent comercial + necessidade + dor + empresa privada": "WARM/HOT",
+}
+st.dataframe(pd.DataFrame([{"Cenário":k,"Resultado esperado":v} for k,v in test.items()]),use_container_width=True,hide_index=True)
 
-if st.button("🚀 IR PARA CAÇA", type="primary", use_container_width=True):
-    with st.spinner("Caça em andamento..."):
-        diag, sources, sigs, comps, stats, unassigned = run_hunt()
-
-    st.success(
-        f"Caça concluída — {sources} fontes | {sigs} sinais novos | "
-        f"{comps} empresas | {stats['new']} novas oportunidades | "
-        f"{stats['updated']} atualizadas | {unassigned} sinais sem empresa"
-    )
-
-    st.subheader("🔬 Diagnóstico MILO → Empresa")
-
-    d1, d2, d3, d4 = st.columns(4)
-    d1.metric("Candidatos extraídos", diag["candidate_extracted"])
-    d2.metric("Empresas resolvidas", diag["resolved_existing"] + diag["resolved_new"])
-    d3.metric("Não resolvidos", diag["not_resolved"])
-    d4.metric("Sinais sem empresa", diag["signals_without_company"])
-    st.caption(f"Reprocessamento do estoque: {diag['reprocessed']} fontes antigas analisadas → {diag['reprocessed_resolved']} resolvidas.")
-
-    st.write("**Origem dos candidatos encontrados**")
-    st.dataframe(pd.DataFrame([{
-        "Explícito/PNCP": diag["explicit_candidate"],
-        "Título": diag["title_candidate"],
-        "Corpo": diag["body_candidate"],
-        "Domínio (diagnóstico)": diag["domain_candidate"],
-    }]), use_container_width=True, hide_index=True)
-
-    st.write("**Funil de resolução**")
-    st.dataframe(pd.DataFrame([{
-        "Fontes": diag["sources"],
-        "Candidatos": diag["candidate_extracted"],
-        "Resolvidas": diag["resolved_existing"] + diag["resolved_new"],
-        "Não resolvidas": diag["not_resolved"],
-        "Sinais": diag["signals_total"],
-        "Sinais com empresa": diag["signals_with_company"],
-        "Sinais sem empresa": diag["signals_without_company"],
-    }]), use_container_width=True, hide_index=True)
-
-    if diag["examples"]:
-        st.write("**Amostra das falhas de resolução**")
-        st.dataframe(pd.DataFrame(diag["examples"]), use_container_width=True, hide_index=True)
-
-tab1, tab2, tab3, tab4 = st.tabs(["🎯 Oportunidades", "🧠 Sinais do Milo", "🏢 Empresas", "📊 Histórico"])
-
+# OPORTUNIDADES — somente HOT/WARM.
+tab1,tab2,tab3,tab4=st.tabs(["🎯 Oportunidades","🔥 Fontes quentes","🏢 Empresas","📊 Histórico"])
 with tab1:
-    rows = conn.execute("""
-        SELECT o.*, c.name company, c.icp
-        FROM opportunities o JOIN companies c ON c.id=o.company_id
-        WHERE o.classification IN ('HOT','WARM')
-        ORDER BY o.score DESC, o.updated_at DESC
-    """).fetchall()
+    rows=conn.execute("""SELECT o.*,c.name company,c.icp,
+        (SELECT src.title FROM sources src JOIN signals ss ON ss.source_id=src.id WHERE ss.company_id=o.company_id ORDER BY src.id DESC LIMIT 1) source_title,
+        (SELECT src.url FROM sources src JOIN signals ss ON ss.source_id=src.id WHERE ss.company_id=o.company_id ORDER BY src.id DESC LIMIT 1) source_url
+        FROM opportunities o JOIN companies c ON c.id=o.company_id WHERE o.classification IN ('HOT','WARM') ORDER BY CASE o.classification WHEN 'HOT' THEN 1 ELSE 2 END,o.score DESC,o.updated_at DESC""").fetchall()
     if rows:
-        df = pd.DataFrame([dict(r) for r in rows])
-        st.dataframe(df, use_container_width=True, hide_index=True)
-    else:
-        st.info("Nenhuma oportunidade qualificada ainda.")
-
+        df=pd.DataFrame([dict(r) for r in rows])
+        st.dataframe(df,use_container_width=True,hide_index=True)
+    else: st.info("Nenhuma oportunidade real qualificada. Isso é preferível a falso positivo.")
 with tab2:
-    rows = conn.execute("""
-        SELECT s.id,c.name company,s.kind,s.confidence,s.evidence,
-               src.title,src.publisher,src.url,src.source_type,src.collected_at
-        FROM signals s
-        LEFT JOIN companies c ON c.id=s.company_id
-        LEFT JOIN sources src ON src.id=s.source_id
-        ORDER BY s.id DESC
-        LIMIT 1000
-    """).fetchall()
+    rows=conn.execute("""SELECT s.id,c.name company,s.kind,s.confidence,s.evidence,src.title,src.url,src.publisher,src.source_type,src.published_at,src.collected_at FROM signals s LEFT JOIN companies c ON c.id=s.company_id LEFT JOIN sources src ON src.id=s.source_id ORDER BY s.id DESC LIMIT 1000""").fetchall()
     if rows:
-        df = pd.DataFrame([dict(r) for r in rows])
-        st.dataframe(df, use_container_width=True, hide_index=True)
-        st.download_button(
-            "⬇️ Exportar sinais CSV",
-            df.to_csv(index=False).encode("utf-8-sig"),
-            "hunter_techs_sinais.csv",
-            "text/csv",
-        )
-    else:
-        st.info("Nenhum sinal registrado.")
-
+        df=pd.DataFrame([dict(r) for r in rows]); st.dataframe(df,use_container_width=True,hide_index=True)
+        st.download_button("⬇️ Exportar sinais CSV",df.to_csv(index=False).encode("utf-8-sig"),"hunter_techs_sinais.csv","text/csv")
+    else: st.info("Nenhuma fonte quente registrada.")
 with tab3:
-    rows = conn.execute("SELECT id,name,website,icp,created_at,updated_at FROM companies ORDER BY name").fetchall()
-    if rows:
-        st.dataframe(pd.DataFrame([dict(r) for r in rows]), use_container_width=True, hide_index=True)
-    else:
-        st.info("Nenhuma empresa resolvida.")
-
+    rows=conn.execute("SELECT id,name,website,icp,created_at,updated_at FROM companies ORDER BY name").fetchall()
+    if rows: st.dataframe(pd.DataFrame([dict(r) for r in rows]),use_container_width=True,hide_index=True)
+    else: st.info("Nenhuma empresa.")
 with tab4:
-    rows = conn.execute("SELECT * FROM hunts ORDER BY id DESC LIMIT 20").fetchall()
-    if rows:
-        st.dataframe(pd.DataFrame([dict(r) for r in rows]), use_container_width=True, hide_index=True)
-    else:
-        st.info("Nenhuma caça registrada.")
+    rows=conn.execute("SELECT * FROM hunts ORDER BY id DESC LIMIT 20").fetchall()
+    if rows: st.dataframe(pd.DataFrame([dict(r) for r in rows]),use_container_width=True,hide_index=True)
+    else: st.info("Nenhuma caça registrada.")
 
 st.divider()
-st.caption("V11 — Caça B2B privada: notícias, governo e licitações não entram como oportunidade. WATCH é monitoramento; oportunidade comercial exige Buying Intent + Need/Pain.")
+st.caption("V12: GOV/PNCP/licitação fora da caça. Fonte NEWS é descoberta/dor; intent comercial exige fonte direta. Oportunidade = empresa privada + ICP provável + necessidade + dor + intenção de compra + recência.")
